@@ -57,7 +57,7 @@ SKIP_PREVIOUSLY_FORECASTED_QUESTIONS = True
 
 # Environment variables
 # You only need *either* Exa or Perplexity or AskNews keys for online research
-METACULUS_TOKEN = os.getenv("METACULUS_BOT_TOKEN")
+METACULUS_TOKEN = os.getenv("METACULUS_TOKEN")
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 ASKNEWS_CLIENT_ID = os.getenv("ASKNEWS_CLIENT_ID")
 ASKNEWS_SECRET = os.getenv("ASKNEWS_SECRET")
