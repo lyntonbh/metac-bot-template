@@ -49,7 +49,7 @@ Updates pending for Spring season:
 ######################### CONSTANTS #########################
 # Constants
 SUBMIT_PREDICTION = True  # set to True to publish your predictions to Metaculus
-USE_EXAMPLE_QUESTIONS = False  # set to True to forecast example questions rather than the tournament questions
+USE_EXAMPLE_QUESTIONS = True  # set to True to forecast example questions rather than the tournament questions
 NUM_RUNS_PER_QUESTION = (
     5  # The median forecast is taken between NUM_RUNS_PER_QUESTION runs
 )
@@ -57,7 +57,7 @@ SKIP_PREVIOUSLY_FORECASTED_QUESTIONS = True
 
 # Environment variables
 # You only need *either* Exa or Perplexity or AskNews keys for online research
-METACULUS_TOKEN = os.getenv("METACULUS_TOKEN")
+METACULUS_TOKEN = os.getenv("METACULUS_BOT_TOKEN")
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 ASKNEWS_CLIENT_ID = os.getenv("ASKNEWS_CLIENT_ID")
 ASKNEWS_SECRET = os.getenv("ASKNEWS_SECRET")
@@ -255,7 +255,7 @@ CONCURRENT_REQUESTS_LIMIT = 5
 llm_rate_limiter = asyncio.Semaphore(CONCURRENT_REQUESTS_LIMIT)
 
 
-async def call_llm(prompt: str, model: str = "gpt-4o", temperature: float = 0.3) -> str:
+async def call_llm(prompt: str, model: str = "deepseek/deepseek-v3.2", temperature: float = 0.6) -> str:
     """
     Makes a streaming completion request to OpenAI's API with concurrent request limiting.
     """
@@ -374,7 +374,7 @@ def call_asknews(question: str) -> str:
     # get the latest news related to the query (within the past 48 hours)
     hot_response = ask.news.search_news(
         query=question,  # your natural language query
-        n_articles=6,  # control the number of articles to include in the context, originally 5
+        n_articles=10,  # control the number of articles to include in the context, originally 5
         return_type="both",
         strategy="latest news",  # enforces looking at the latest news only
     )
@@ -382,7 +382,7 @@ def call_asknews(question: str) -> str:
     # get context from the "historical" database that contains a news archive going back to 2023
     historical_response = ask.news.search_news(
         query=question,
-        n_articles=10,
+        n_articles=15,
         return_type="both",
         strategy="news knowledge",  # looks for relevant news within the past 60 days
     )
@@ -422,7 +422,8 @@ def call_asknews(question: str) -> str:
 # This section includes functionality for binary questions.
 
 BINARY_PROMPT_TEMPLATE = """
-You are a professional forecaster interviewing for a job.
+You are a Superforecaster with a track record of highly accurate, calibrated predictions.
+Your goal is to predict the probability of the following binary question resolving 'Yes'.
 
 Your interview question is:
 {title}
@@ -442,11 +443,19 @@ Your research assistant says:
 
 Today is {today}.
 
-Before answering you write:
-(a) The time left until the outcome to the question is known.
-(b) The status quo outcome if nothing changed.
-(c) A brief description of a scenario that results in a No outcome.
-(d) A brief description of a scenario that results in a Yes outcome.
+# Instructions
+You must use the "Inside/Outside View" methodology. Structure your response in the following strict order:
+
+1. **Resolution Analysis**: Break down the resolution criteria. Identify any "edge cases" or technicalities where the outcome might differ from the common intuition.
+2. **The Outside View (Base Rate)**: ignoring the specific news of this question, how often do similar scenarios historically resolve "Yes"? (e.g., "Bills in this committee pass 20% of the time").
+3. **The Inside View (Status Quo & Trends)**:
+   - What is the status quo if nothing changes?
+   - How does the evidence in the Research Report update the Base Rate?
+   - If the Research Report mentions betting markets or other forecasts, how reliable are they?
+4. **Scenarios**:
+   - Describe a plausible scenario that results in a **NO** outcome.
+   - Describe a plausible scenario that results in a **YES** outcome.
+5. **Final Calculation**: Synthesize the Base Rate with the specific evidence to reach a final number.
 
 You write your rationale remembering that good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time.
 
@@ -549,15 +558,26 @@ Formatting Instructions:
 - Never use scientific notation.
 - Always start with a smaller number (more negative if negative) and then increase from there
 
-Before answering you write:
-(a) The time left until the outcome to the question is known.
-(b) The outcome if nothing changed.
-(c) The outcome if the current trend continued.
-(d) The expectations of experts and markets.
-(e) A brief description of an unexpected scenario that results in a low outcome.
-(f) A brief description of an unexpected scenario that results in a high outcome.
+# Instructions
+You must use the "Anchor and Adjust" methodology. Structure your reasoning in this strict order:
 
-You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unkowns.
+1. **Time Horizon**: Calculate exactly how much time remains until resolution. Is this a short-term trend extrapolation or a long-term uncertain event?
+
+2. **The Outside View (Base Rate)**:
+   - Historically, what is the typical range for this metric? (e.g., "GDP usually grows 1-4%").
+   - What are the historical min/max extremes?
+
+3. **The Inside View (Trends & Components)**:
+   - **Trend Diagnosis & Extrapolation**: Identify the regime (Linear, Exponential, or Mean-Reverting) and project the value to the resolution date based on current data.
+   - **Component Analysis**: If specific data is missing, use Fermi Estimation (break the problem into sub-components).
+   - **Trend Fragility & Events**: Consider conditions under which this trend would shift or break (e.g., saturation points, regulatory cliffs) OR dates where major new information is revealed (e.g., Fed meetings, earnings reports). Does this create a risk of a regime shift or high volatility?
+   - **Consensus**: Does the research report mention specific forecasts by experts?
+
+4. **The Tails (P10 and P90)**:
+   - **Low Case (P10)**: Imagine the outcome is surprisingly low. What specific "shock" caused this?
+   - **High Case (P90)**: Imagine the outcome is surprisingly high. What specific "shock" caused this?
+
+5. **Calibration Check**: Look at your P10 and P90. Are they wide enough? (AI models are often too confident). 
 
 The last thing you write is your final answer as:
 "
@@ -1219,7 +1239,8 @@ async def get_numeric_gpt_prediction(
 # @title Multiple Choice prompt & functions
 
 MULTIPLE_CHOICE_PROMPT_TEMPLATE = """
-You are a professional forecaster interviewing for a job.
+You are a Superforecaster with a track record of highly accurate, calibrated predictions.
+Your goal is to assign probabilities to the following mutually exclusive options.
 
 Your interview question is:
 {title}
@@ -1240,10 +1261,32 @@ Your research assistant says:
 
 Today is {today}.
 
-Before answering you write:
-(a) The time left until the outcome to the question is known.
-(b) The status quo outcome if nothing changed.
-(c) A description of an scenario that results in an unexpected outcome.
+# Instructions
+You must use a "Probabilistic Weighting" methodology. Structure your reasoning in this strict order:
+
+1. **Question Classification**: 
+   - Is this an **Ordinal** question (dates, ranges) or a **Nominal** question (distinct entities)?
+   - *If Ordinal:* The probabilities should likely form a curve (e.g., Bell Curve) where adjacent options have related probabilities.
+   - *If Nominal:* The options are independent competitors (a "Horse Race").
+
+2. **The Outside View (Base Rate)**:
+   - In similar historical cases, how is probability usually distributed? 
+   - Is there usually a clear favorite (Winner-Take-All), or is the field usually fragmented (High Entropy)?
+   - *Example:* "In elections, incumbents have high base rates. In startup exits, the field is highly fragmented."
+
+3. **Evidence Evaluation (Inside View)**:
+   - Review the Research Report. For **each** option, assess the specific evidence supporting it.
+   - **Do not artificially eliminate options.** If the news is silent or ambiguous, you must maintain uncertainty (a wider/flatter distribution) rather than guessing a winner.
+   - Look for "Negative Evidence": Does the report explicitly rule out any options?
+
+4. **Distribution Strategy**:
+   - Based on Step 3, determine the **Shape** of your forecast.
+   - **High Certainty:** If evidence is strong for one outcome, concentrate mass there.
+   - **High Uncertainty:** If evidence is weak or conflicting, revert to a "Uniform Distribution" (equal chance) or "Maximum Entropy" approach to avoid false confidence.
+
+5. **Final Assignment & Normalization**:
+   - Assign a raw probability score to each option.
+   - **CRITICAL STEP:** Sum your scores. If they do not equal 100%, normalize them mathematically so they sum to exactly 100%.
 
 You write your rationale remembering that (1) good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time, and (2) good forecasters leave some moderate probability on most options to account for unexpected outcomes.
 
