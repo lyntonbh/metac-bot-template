@@ -80,7 +80,7 @@ CURRENT_METACULUS_CUP_ID = None # TBD (Use the slug from the Metaculus Cup URL)
 AXC_2025_TOURNAMENT_ID = 32564
 AI_2027_TOURNAMENT_ID = "ai-2027"
 
-TOURNAMENT_ID = FALL_2025_AI_BENCHMARKING_ID
+TOURNAMENT_ID = SPRING_2026_AI_BENCHMARKING_ID
 
 # The example questions can be used for testing your bot. (note that question and post id are not always the same)
 EXAMPLE_QUESTIONS = [  # (question_id, post_id)
