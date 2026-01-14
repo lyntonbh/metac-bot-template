@@ -201,7 +201,7 @@ def list_posts_from_tournament(
                 "discrete",
             ]
         ),
-        "tournaments": [tournament_id],
+        "project": TOURNAMENT_ID,
         "statuses": "open",
         "include_description": "true",
     }
