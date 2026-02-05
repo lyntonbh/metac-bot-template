@@ -241,7 +241,7 @@ def get_post_details(post_id: int) -> dict:
     Get all details about a post from the Metaculus API.
     """
     print(f"Sleeping for 10 seconds to avoid Cloudflare ban...")
-    time.sleep(10)
+    time.sleep(20)
     url = f"{API_BASE_URL}/posts/{post_id}/"
     print(f"Getting details for {url}")
     response = requests.get(
