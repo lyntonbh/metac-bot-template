@@ -109,6 +109,9 @@ EXAMPLE_QUESTIONS = [  # (question_id, post_id)
 # @title Helper functions
 AUTH_HEADERS = {"headers": {"Authorization": f"Token {METACULUS_TOKEN}"}}
 API_BASE_URL = "https://www.metaculus.com/api"
+REQUEST_TIMEOUT_SECONDS = 45
+MAX_POST_DETAILS_RETRIES = 5
+TRANSIENT_HTTP_STATUS_CODES = {401, 403, 429, 500, 502, 503, 504}
 
 
 def post_question_comment(post_id: int, comment_text: str) -> None:
@@ -240,18 +243,50 @@ def get_post_details(post_id: int) -> dict:
     """
     Get all details about a post from the Metaculus API.
     """
-    print(f"Sleeping for 10 seconds to avoid Cloudflare ban...")
-    time.sleep(20)
     url = f"{API_BASE_URL}/posts/{post_id}/"
-    print(f"Getting details for {url}")
-    response = requests.get(
-        url,
-        **AUTH_HEADERS,  # type: ignore
-    )
-    if not response.ok:
-        raise Exception(response.text)
-    details = json.loads(response.content)
-    return details
+    for attempt in range(1, MAX_POST_DETAILS_RETRIES + 1):
+        # Avoid bursty access patterns that trigger Cloudflare.
+        sleep_seconds = 8 + (attempt - 1) * 7
+        print(f"Sleeping for {sleep_seconds} seconds before loading post {post_id}...")
+        time.sleep(sleep_seconds)
+        print(f"Getting details for {url} (attempt {attempt}/{MAX_POST_DETAILS_RETRIES})")
+        try:
+            response = requests.get(
+                url,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+                **AUTH_HEADERS,  # type: ignore
+            )
+        except requests.RequestException as e:
+            if attempt < MAX_POST_DETAILS_RETRIES:
+                print(
+                    f"Request failed for post {post_id} with {type(e).__name__}: {e}. Retrying..."
+                )
+                continue
+            raise Exception(
+                f"Request failed for post {post_id} after {MAX_POST_DETAILS_RETRIES} attempts: {e}"
+            ) from e
+
+        if response.ok:
+            details = json.loads(response.content)
+            return details
+
+        status = response.status_code
+        text = response.text or ""
+        is_transient = (
+            status in TRANSIENT_HTTP_STATUS_CODES or "Authorization Required" in text
+        )
+        if is_transient and attempt < MAX_POST_DETAILS_RETRIES:
+            print(
+                f"Transient HTTP {status} for post {post_id}. Retrying..."
+            )
+            continue
+
+        snippet = text[:500].replace("\n", " ")
+        raise Exception(
+            f"Failed to load post {post_id}. HTTP {status}. Response snippet: {snippet}"
+        )
+
+    raise Exception(f"Failed to load post {post_id} after retries")
 
 
 CONCURRENT_REQUESTS_LIMIT = 5
@@ -1546,17 +1581,21 @@ async def forecast_questions(
     num_runs_per_question: int,
     skip_previously_forecasted_questions: bool,
 ) -> None:
-    forecast_tasks = [
-        forecast_individual_question(
-            question_id,
-            post_id,
-            submit_prediction,
-            num_runs_per_question,
-            skip_previously_forecasted_questions,
-        )
-        for question_id, post_id in open_question_id_post_id
-    ]
-    forecast_summaries = await asyncio.gather(*forecast_tasks, return_exceptions=True)
+    # Process questions sequentially to reduce API throttling/Cloudflare blocks.
+    forecast_summaries = []
+    for question_id, post_id in open_question_id_post_id:
+        try:
+            summary = await forecast_individual_question(
+                question_id,
+                post_id,
+                submit_prediction,
+                num_runs_per_question,
+                skip_previously_forecasted_questions,
+            )
+            forecast_summaries.append(summary)
+        except Exception as e:
+            forecast_summaries.append(e)
+
     print("\n", "#" * 100, "\nForecast Summaries\n", "#" * 100)
 
     errors = []
@@ -1576,7 +1615,12 @@ async def forecast_questions(
         print("-----------------------------------------------\nErrors:\n")
         error_message = f"Errors were encountered: {errors}"
         print(error_message)
-        raise RuntimeError(error_message)
+        success_count = len(open_question_id_post_id) - len(errors)
+        if success_count == 0:
+            raise RuntimeError(error_message)
+        print(
+            f"Continuing with success: {success_count} questions processed, {len(errors)} failed."
+        )
 
 
 ######################## FINAL RUN #########################
