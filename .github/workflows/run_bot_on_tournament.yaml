@@ -2,6 +2,15 @@ name: Forecast on new AI tournament questions
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode"
+        required: true
+        default: "tournament"
+        type: choice
+        options:
+          - tournament
+          - repredict_tournament
   schedule:
     - cron: "*/20 * * * *" # runs every 20 minutes. Make sure to skip already forecasted questions!
 
@@ -39,10 +48,11 @@ jobs:
         run: poetry install --no-interaction --no-root
       - name: Run bot
         run: |
-          poetry run python main_with_no_framework.py
+          poetry run python main.py --mode "$RUN_MODE"
         # this reads the environment variables from the github repository.
         # Store under Settings --> Secrets and variables --> Actions
         env:
+          RUN_MODE: ${{ github.event.inputs.mode || 'tournament' }}
           METACULUS_TOKEN: ${{ secrets.METACULUS_BOT_TOKEN }} # replace this with the name of the variable under which you stored your own Metaculus token
           PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
           EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
