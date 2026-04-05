@@ -141,31 +141,37 @@ class SpringTemplateBot2026(ForecastBot):
                 """
             )
 
-            if isinstance(researcher, GeneralLlm):
-                research = await researcher.invoke(prompt)
-            elif (
-                researcher == "asknews/news-summaries"
-                or researcher == "asknews/deep-research/low-depth"
-                or researcher == "asknews/deep-research/medium-depth"
-                or researcher == "asknews/deep-research/high-depth"
-            ):
-                research = await AskNewsSearcher().call_preconfigured_version(
-                    researcher, prompt
+            try:
+                if isinstance(researcher, GeneralLlm):
+                    research = await researcher.invoke(prompt)
+                elif (
+                    researcher == "asknews/news-summaries"
+                    or researcher == "asknews/deep-research/low-depth"
+                    or researcher == "asknews/deep-research/medium-depth"
+                    or researcher == "asknews/deep-research/high-depth"
+                ):
+                    research = await AskNewsSearcher().call_preconfigured_version(
+                        researcher, prompt
+                    )
+                elif researcher.startswith("smart-searcher"):
+                    model_name = researcher.removeprefix("smart-searcher/")
+                    searcher = SmartSearcher(
+                        model=model_name,
+                        temperature=0,
+                        num_searches_to_run=2,
+                        num_sites_per_search=10,
+                        use_advanced_filters=False,
+                    )
+                    research = await searcher.invoke(prompt)
+                elif not researcher or researcher == "None" or researcher == "no_research":
+                    research = ""
+                else:
+                    research = await self.get_llm("researcher", "llm").invoke(prompt)
+            except Exception as e:
+                logger.warning(
+                    f"Research failed for {question.page_url}, proceeding without research: {e}"
                 )
-            elif researcher.startswith("smart-searcher"):
-                model_name = researcher.removeprefix("smart-searcher/")
-                searcher = SmartSearcher(
-                    model=model_name,
-                    temperature=0,
-                    num_searches_to_run=2,
-                    num_sites_per_search=10,
-                    use_advanced_filters=False,
-                )
-                research = await searcher.invoke(prompt)
-            elif not researcher or researcher == "None" or researcher == "no_research":
                 research = ""
-            else:
-                research = await self.get_llm("researcher", "llm").invoke(prompt)
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
 
