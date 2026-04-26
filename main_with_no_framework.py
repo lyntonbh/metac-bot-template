@@ -293,7 +293,7 @@ CONCURRENT_REQUESTS_LIMIT = 5
 llm_rate_limiter = asyncio.Semaphore(CONCURRENT_REQUESTS_LIMIT)
 
 
-async def call_llm(prompt: str, model: str = "deepseek/deepseek-v3.2", temperature: float = 0.6) -> str:
+async def call_llm(prompt: str, model: str = "deepseek/deepseek-v4-pro", temperature: float = 0.6) -> str:
     """
     Makes a streaming completion request with concurrent request limiting.
     """
