@@ -1505,6 +1505,12 @@ class SpringTemplateBot2026(ForecastBot):
             or researcher == "asknews/deep-research/medium-depth"
             or researcher == "asknews/deep-research/high-depth"
         ):
+            if not os.getenv("ASKNEWS_CLIENT_ID") or not os.getenv("ASKNEWS_SECRET"):
+                logger.warning(
+                    "AskNews researcher configured but ASKNEWS_CLIENT_ID/ASKNEWS_SECRET are missing; skipping AskNews research for %s.",
+                    question.page_url,
+                )
+                return ""
             asknews_query = (
                 question.question_text
                 if researcher == "asknews/news-summaries"
@@ -3565,7 +3571,7 @@ if __name__ == "__main__":
             "summarizer": os.getenv(
                 "SUMMARIZER_MODEL", "openrouter/openai/gpt-5-nano"
             ),
-            "researcher": "asknews/news-summaries",
+            "researcher": os.getenv("RESEARCHER_MODEL", "asknews/news-summaries"),
             "parser": os.getenv("PARSER_MODEL", "openrouter/openai/gpt-5-nano"),
         },
     )
