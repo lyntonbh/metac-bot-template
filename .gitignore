@@ -1,6 +1,8 @@
 ###  Specific to Project ###
 benchmarks/
 sandbox.py
+research_cache/
+experiment_logs/
 
 
 ### General gitignore ###

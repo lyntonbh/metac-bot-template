@@ -11,6 +11,10 @@ on:
         options:
           - tournament
           - repredict_tournament
+      tournament_ids:
+        description: "Comma-separated tournament slugs/IDs to forecast"
+        required: true
+        default: "summer-futureeval-2026"
   schedule:
     - cron: "*/20 * * * *" # runs every 20 minutes. Make sure to skip already forecasted questions!
 
@@ -25,13 +29,30 @@ jobs:
   forecast_job:
     runs-on: ubuntu-latest # determines the machine that will run the job - keep as is
     steps: # sets up the steps that will be run in order
+      - name: Check tournament window
+        id: tournament_window
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            now="$(date -u +%s)"
+            tournament_start="$(date -u -d '2026-05-18 00:00:00 UTC' +%s)"
+            if [ "$now" -lt "$tournament_start" ]; then
+              echo "Scheduled run skipped before Summer FutureEval starts."
+              echo "should_run=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "should_run=true" >> "$GITHUB_OUTPUT"
       # setup repository with all necessary dependencies - keep as is
       - name: Check out repository
+        if: steps.tournament_window.outputs.should_run == 'true'
         uses: actions/checkout@v3
       - uses: actions/setup-python@v4
+        if: steps.tournament_window.outputs.should_run == 'true'
         with:
           python-version: "3.11"
       - name: Install poetry
+        if: steps.tournament_window.outputs.should_run == 'true'
         uses: snok/install-poetry@v1
         with:
           virtualenvs-create: true
@@ -45,15 +66,26 @@ jobs:
       #     path: .venv
       #     key: venv-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('**/poetry.lock') }}
       - name: Install dependencies
+        if: steps.tournament_window.outputs.should_run == 'true'
         run: poetry install --no-interaction --no-root
       - name: Run bot
+        if: steps.tournament_window.outputs.should_run == 'true'
         run: |
-          poetry run python main.py --mode "$RUN_MODE"
+          TOURNAMENT_ARGS=()
+          IFS=',' read -ra IDS <<< "$TOURNAMENT_IDS"
+          for id in "${IDS[@]}"; do
+            trimmed="$(echo "$id" | xargs)"
+            if [ -n "$trimmed" ]; then
+              TOURNAMENT_ARGS+=(--tournament-id "$trimmed")
+            fi
+          done
+          poetry run python main.py --mode "$RUN_MODE" "${TOURNAMENT_ARGS[@]}"
         # this reads the environment variables from the github repository.
         # Store under Settings --> Secrets and variables --> Actions
         env:
           RUN_MODE: ${{ github.event.inputs.mode || 'tournament' }}
           METACULUS_TOKEN: ${{ secrets.METACULUS_BOT_TOKEN }} # replace this with the name of the variable under which you stored your own Metaculus token
+          TOURNAMENT_IDS: ${{ github.event.inputs.tournament_ids || 'summer-futureeval-2026' }}
           PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
           EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -61,3 +93,15 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          EXPERIMENT_MODE: "off"
+          ENABLE_EXPERIMENT_VARIANTS: "false"
+          ALLOW_PUBLISH_EXPERIMENTS: "false"
+          ENABLE_EXPERIMENT_LOGGING: "true"
+          EXPERIMENT_LOG_DIR: "experiment_logs"
+      - name: Upload forecast logs
+        if: always() && steps.tournament_window.outputs.should_run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: forecast-logs-${{ github.run_id }}
+          path: experiment_logs/
+          if-no-files-found: ignore

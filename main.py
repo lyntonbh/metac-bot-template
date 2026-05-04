@@ -1,9 +1,21 @@
 import argparse
 import asyncio
+import hashlib
+import json
 import logging
+import math
+import os
+import random
+import re
+import statistics
+import time
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from typing import Literal
+from pathlib import Path
+import dotenv
+from typing import Any, Literal, TypeVar
 
+import requests
 
 from forecasting_tools import (
     AskNewsSearcher,
@@ -12,8 +24,10 @@ from forecasting_tools import (
     GeneralLlm,
     MetaculusClient,
     MetaculusQuestion,
+    MultipleChoiceReport,
     MultipleChoiceQuestion,
     NumericDistribution,
+    NumericReport,
     NumericQuestion,
     DateQuestion,
     DatePercentile,
@@ -31,6 +45,295 @@ from forecasting_tools import (
 )
 
 logger = logging.getLogger(__name__)
+T = TypeVar("T")
+
+
+@dataclass
+class EvidenceItem:
+    source: str
+    provider: str
+    title: str
+    url: str
+    retrieved_at: str
+    summary: str
+    value: str = ""
+    unit: str = ""
+    date: str = ""
+    probability: float | None = None
+    directness: str = "weak"
+    caveats: str = ""
+    raw: dict[str, Any] | None = None
+
+
+@dataclass
+class ForecasterRoleSpec:
+    name: str
+    llm: GeneralLlm
+    instructions: str
+
+
+@dataclass(frozen=True)
+class ExperimentVariant:
+    id: int
+    name: str
+    description: str
+    env_overrides: dict[str, str]
+
+
+EXPERIMENT_VARIANTS: tuple[ExperimentVariant, ...] = (
+    ExperimentVariant(
+        id=0,
+        name="role_ensemble_control",
+        description="Current role-specialized cheap ensemble with default research and escalation.",
+        env_overrides={},
+    ),
+    ExperimentVariant(
+        id=1,
+        name="market_data_heavy",
+        description="Lean harder on direct market/official data and require larger cheap-model disagreement before escalation.",
+        env_overrides={
+            "ENABLE_DIRECT_STRUCTURED_RESEARCH": "true",
+            "ENABLE_DIRECT_MARKET_APIS": "true",
+            "ENABLE_MARKET_PRIOR_RESEARCH": "true",
+            "ENABLE_OFFICIAL_DATA_RESEARCH": "true",
+            "DIRECT_EVIDENCE_MAX_ITEMS": "30",
+            "ENABLE_DEEP_RESEARCH_ON_DISAGREEMENT": "false",
+            "BINARY_ESCALATION_SPREAD": "0.25",
+            "MULTIPLE_CHOICE_ESCALATION_SPREAD": "0.28",
+            "NUMERIC_ESCALATION_RANGE_FRACTION": "0.15",
+        },
+    ),
+    ExperimentVariant(
+        id=2,
+        name="deep_research_sensitive",
+        description="Escalate and deep-research sooner when cheap roles disagree.",
+        env_overrides={
+            "ENABLE_DEEP_RESEARCH_ON_DISAGREEMENT": "true",
+            "ENABLE_DEEP_RESEARCH_ON_HIGH_VALUE": "true",
+            "BINARY_ESCALATION_SPREAD": "0.15",
+            "MULTIPLE_CHOICE_ESCALATION_SPREAD": "0.18",
+            "NUMERIC_ESCALATION_RANGE_FRACTION": "0.09",
+            "NUMERIC_ESCALATION_RELATIVE_FRACTION": "0.35",
+        },
+    ),
+    ExperimentVariant(
+        id=3,
+        name="same_model_deepseek_roles",
+        description="Use DeepSeek for all cheap roles; duplicate-model role passes are bundled before aggregation.",
+        env_overrides={
+            "BASE_RATE_FORECASTER_MODEL": "openrouter/deepseek/deepseek-v4-pro",
+            "INSIDE_VIEW_FORECASTER_MODEL": "openrouter/deepseek/deepseek-v4-pro",
+            "MARKET_DATA_FORECASTER_MODEL": "openrouter/deepseek/deepseek-v4-pro",
+        },
+    ),
+    ExperimentVariant(
+        id=4,
+        name="same_model_mistral_roles",
+        description="Use Mistral Large for all cheap roles as a lower-cost Western/European control.",
+        env_overrides={
+            "BASE_RATE_FORECASTER_MODEL": "openrouter/mistralai/mistral-large-2512",
+            "INSIDE_VIEW_FORECASTER_MODEL": "openrouter/mistralai/mistral-large-2512",
+            "MARKET_DATA_FORECASTER_MODEL": "openrouter/mistralai/mistral-large-2512",
+        },
+    ),
+    ExperimentVariant(
+        id=5,
+        name="thin_research_control",
+        description="Disable direct structured, market-prior, official-data, and deep-research passes to measure research-layer value.",
+        env_overrides={
+            "ENABLE_DIRECT_STRUCTURED_RESEARCH": "false",
+            "ENABLE_MARKET_PRIOR_RESEARCH": "false",
+            "ENABLE_OFFICIAL_DATA_RESEARCH": "false",
+            "ENABLE_DEEP_RESEARCH_ON_DISAGREEMENT": "false",
+            "ENABLE_DEEP_RESEARCH_ON_HIGH_VALUE": "false",
+        },
+    ),
+)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _select_experiment_variant(
+    mode: str, requested_variant_id: int | None, seed: int | None
+) -> tuple[ExperimentVariant | None, int | None]:
+    if requested_variant_id is not None and mode == "off":
+        mode = "variant"
+    if mode == "off":
+        return None, seed
+    variants_by_id = {variant.id: variant for variant in EXPERIMENT_VARIANTS}
+    if mode == "variant":
+        if requested_variant_id is None:
+            raise ValueError("--experiment-variant is required when --experiment-mode=variant")
+        if requested_variant_id not in variants_by_id:
+            raise ValueError(
+                f"Unknown experiment variant {requested_variant_id}. "
+                f"Available variants: {sorted(variants_by_id)}"
+            )
+        return variants_by_id[requested_variant_id], seed
+
+    if seed is None:
+        seed = int(time.time_ns() % (2**31 - 1))
+    rng = random.Random(seed)
+    return rng.choice(EXPERIMENT_VARIANTS), seed
+
+
+def _apply_experiment_variant(variant: ExperimentVariant | None) -> None:
+    if variant is None:
+        return
+    for env_name, env_value in variant.env_overrides.items():
+        os.environ[env_name] = env_value
+    logger.info(
+        "Selected experiment variant %s (%s): %s",
+        variant.id,
+        variant.name,
+        variant.description,
+    )
+
+
+def _json_safe(value: Any, max_text_chars: int = 25000) -> Any:
+    if value is None or isinstance(value, bool | int | float):
+        return value
+    if isinstance(value, str):
+        return value[:max_text_chars]
+    if isinstance(value, BaseException):
+        return {"type": type(value).__name__, "message": repr(value)}
+    if dataclasses := getattr(value, "__dataclass_fields__", None):
+        try:
+            return _json_safe(asdict(value), max_text_chars=max_text_chars)
+        except Exception:
+            return str(dataclasses)[:max_text_chars]
+    if hasattr(value, "model_dump"):
+        try:
+            return _json_safe(value.model_dump(), max_text_chars=max_text_chars)
+        except Exception:
+            pass
+    if isinstance(value, dict):
+        return {
+            str(key): _json_safe(item, max_text_chars=max_text_chars)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple, set)):
+        return [
+            _json_safe(item, max_text_chars=max_text_chars)
+            for item in value
+        ]
+    return str(value)[:max_text_chars]
+
+
+def _question_log_record(question: Any) -> dict[str, Any]:
+    if question is None:
+        return {}
+    field_names = [
+        "id",
+        "id_of_post",
+        "question_text",
+        "page_url",
+        "background_info",
+        "resolution_criteria",
+        "fine_print",
+        "close_time",
+        "scheduled_resolution_time",
+        "conditional_type",
+    ]
+    record = {
+        field_name: _json_safe(getattr(question, field_name, None), max_text_chars=6000)
+        for field_name in field_names
+    }
+    record["question_object_type"] = type(question).__name__
+    return record
+
+
+def _report_log_record(report: Any) -> dict[str, Any]:
+    if isinstance(report, BaseException):
+        return {
+            "status": "exception",
+            "report_type": type(report).__name__,
+            "exception": _json_safe(report),
+        }
+    question = getattr(report, "question", None)
+    return {
+        "status": "ok",
+        "report_type": type(report).__name__,
+        "question": _question_log_record(question),
+        "prediction": _json_safe(getattr(report, "prediction", None)),
+        "explanation": _json_safe(getattr(report, "explanation", "")),
+        "research": _json_safe(getattr(report, "research", "")),
+    }
+
+
+def _write_experiment_logs(
+    forecast_reports: list[Any],
+    *,
+    run_id: str,
+    log_dir: Path,
+    mode: str,
+    target_tournament_ids: list[str | int],
+    selected_variant: ExperimentVariant | None,
+    experiment_seed: int | None,
+    publish_reports: bool,
+) -> None:
+    if not _env_bool("ENABLE_EXPERIMENT_LOGGING", True):
+        return
+    run_dir = log_dir / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    variant_payload = (
+        {
+            "id": selected_variant.id,
+            "name": selected_variant.name,
+            "description": selected_variant.description,
+            "env_overrides": selected_variant.env_overrides,
+        }
+        if selected_variant
+        else None
+    )
+    manifest = {
+        "run_id": run_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "mode": mode,
+        "target_tournament_ids": target_tournament_ids,
+        "publish_reports_to_metaculus": publish_reports,
+        "experiment_seed": experiment_seed,
+        "selected_variant": variant_payload,
+        "runtime_models": {
+            name: os.getenv(name)
+            for name in (
+                "BASE_RATE_FORECASTER_MODEL",
+                "INSIDE_VIEW_FORECASTER_MODEL",
+                "MARKET_DATA_FORECASTER_MODEL",
+                "ESCALATION_FORECASTER_MODEL",
+                "SUMMARIZER_MODEL",
+                "PARSER_MODEL",
+            )
+        },
+        "runtime_research_controls": {
+            name: os.getenv(name)
+            for name in (
+                "ENABLE_DIRECT_STRUCTURED_RESEARCH",
+                "ENABLE_MARKET_PRIOR_RESEARCH",
+                "ENABLE_OFFICIAL_DATA_RESEARCH",
+                "ENABLE_DEEP_RESEARCH_ON_DISAGREEMENT",
+                "ENABLE_DEEP_RESEARCH_ON_HIGH_VALUE",
+            )
+        },
+    }
+    (run_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8"
+    )
+    jsonl_path = run_dir / "forecast_reports.jsonl"
+    with jsonl_path.open("w", encoding="utf-8") as handle:
+        for report in forecast_reports:
+            record = {
+                "run_id": run_id,
+                "variant": variant_payload,
+                "report": _report_log_record(report),
+            }
+            handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+    logger.info("Experiment logs written to %s", run_dir)
 
 
 class SpringTemplateBot2026(ForecastBot):
@@ -81,9 +384,9 @@ class SpringTemplateBot2026(ForecastBot):
                 timeout=40,
                 allowed_tries=2,
             ),
-            "summarizer": "openai/gpt-4o-mini",
+            "summarizer": "openai/gpt-5-nano",
             "researcher": "asknews/news-summaries",
-            "parser": "openai/gpt-4o-mini",
+            "parser": "openai/gpt-5-nano",
         },
     )
     ```
@@ -116,64 +419,2269 @@ class SpringTemplateBot2026(ForecastBot):
     )
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
+    _min_successful_ensemble_predictions = 1
+    _binary_escalation_spread = 0.20
+    _multiple_choice_escalation_spread = 0.22
+    _numeric_escalation_range_fraction = 0.12
+    _numeric_escalation_relative_fraction = 0.50
+    _research_cache_dir = Path("research_cache")
+    _direct_evidence_max_items_per_provider = 5
+    _stop_words = {
+        "about",
+        "above",
+        "after",
+        "again",
+        "against",
+        "between",
+        "before",
+        "below",
+        "could",
+        "does",
+        "during",
+        "from",
+        "have",
+        "into",
+        "more",
+        "most",
+        "over",
+        "question",
+        "resolve",
+        "resolution",
+        "than",
+        "that",
+        "their",
+        "there",
+        "this",
+        "through",
+        "will",
+        "with",
+        "would",
+    }
+    _default_high_value_deep_research_keywords = (
+        "frontier ai,agi,artificial intelligence,ai benchmark,llm,model release,"
+        "election,poll,president,congress,parliament,inflation,gdp,cpi,unemployment,"
+        "interest rate,central bank,fed,ecb,stock,market cap,earnings,crypto,"
+        "war,ceasefire,nuclear,sanction,treaty,geopolitical"
+    )
+    _official_data_topic_keywords: dict[str, tuple[str, ...]] = {
+        "economic": (
+            "inflation",
+            "cpi",
+            "gdp",
+            "unemployment",
+            "jobs",
+            "payroll",
+            "interest rate",
+            "fed",
+            "federal reserve",
+            "ecb",
+            "central bank",
+            "recession",
+            "trade deficit",
+            "exports",
+            "imports",
+            "debt",
+            "deficit",
+        ),
+        "finance": (
+            "stock",
+            "share price",
+            "market cap",
+            "earnings",
+            "revenue",
+            "profit",
+            "bankruptcy",
+            "ipo",
+            "merger",
+            "acquisition",
+            "sec",
+            "filing",
+            "crypto",
+            "bitcoin",
+            "ethereum",
+        ),
+        "ai": (
+            "ai",
+            "artificial intelligence",
+            "frontier model",
+            "llm",
+            "benchmark",
+            "swe-bench",
+            "mmlu",
+            "chatbot arena",
+            "compute",
+            "gpu",
+            "h100",
+            "h200",
+            "b200",
+            "model release",
+        ),
+        "polling": (
+            "election",
+            "poll",
+            "vote share",
+            "approval",
+            "president",
+            "congress",
+            "senate",
+            "house",
+            "parliament",
+            "referendum",
+            "primary",
+        ),
+        "geopolitical": (
+            "war",
+            "ceasefire",
+            "invasion",
+            "missile",
+            "nuclear",
+            "sanction",
+            "treaty",
+            "united nations",
+            "nato",
+            "iaea",
+            "who",
+            "conflict",
+            "military",
+            "geopolitical",
+        ),
+    }
+    _official_data_source_hints: dict[str, str] = {
+        "economic": (
+            "FRED, BLS, BEA, Census, Treasury, Federal Reserve, ECB, Eurostat, "
+            "OECD, World Bank, IMF, national statistical offices, and central bank releases"
+        ),
+        "finance": (
+            "SEC EDGAR, company investor relations, exchange filings, central bank data, "
+            "Yahoo Finance/Nasdaq only as secondary market-data references"
+        ),
+        "ai": (
+            "official lab announcements, model cards, technical reports, arXiv papers, "
+            "Epoch AI, Artificial Analysis, LMSYS/Chatbot Arena, SWE-bench, METR, MLPerf, "
+            "Papers With Code, and benchmark source pages"
+        ),
+        "polling": (
+            "official election authorities, FEC/electoral commission data, polling averages, "
+            "pollster releases, FiveThirtyEight/Nate Silver-style aggregators, and reputable election trackers"
+        ),
+        "geopolitical": (
+            "UN, NATO, IAEA, WHO, IMF/World Bank, government ministries, official statements, "
+            "treaty texts, sanctions lists, ACLED/ISW-style conflict trackers, and major wire services"
+        ),
+    }
+    _fred_series_by_keyword: dict[str, tuple[str, str]] = {
+        "inflation": ("CPIAUCSL", "Consumer Price Index for All Urban Consumers"),
+        "cpi": ("CPIAUCSL", "Consumer Price Index for All Urban Consumers"),
+        "core cpi": ("CPILFESL", "Core CPI"),
+        "unemployment": ("UNRATE", "Unemployment Rate"),
+        "jobless": ("UNRATE", "Unemployment Rate"),
+        "payroll": ("PAYEMS", "All Employees, Total Nonfarm"),
+        "employment": ("PAYEMS", "All Employees, Total Nonfarm"),
+        "gdp": ("GDP", "Gross Domestic Product"),
+        "real gdp": ("GDPC1", "Real Gross Domestic Product"),
+        "recession": ("USREC", "NBER based Recession Indicators"),
+        "fed funds": ("FEDFUNDS", "Effective Federal Funds Rate"),
+        "interest rate": ("FEDFUNDS", "Effective Federal Funds Rate"),
+        "mortgage": ("MORTGAGE30US", "30-Year Fixed Rate Mortgage Average"),
+        "treasury": ("DGS10", "10-Year Treasury Constant Maturity Rate"),
+        "oil": ("DCOILWTICO", "WTI Crude Oil Price"),
+        "gas": ("GASREGW", "US Regular Conventional Gas Price"),
+    }
+    _ai_benchmark_registry: tuple[tuple[str, str, str], ...] = (
+        (
+            "LMArena Chatbot Arena",
+            "https://lmarena.ai/leaderboard/",
+            "Crowd-sourced pairwise model preference leaderboard.",
+        ),
+        (
+            "Artificial Analysis",
+            "https://artificialanalysis.ai/",
+            "Model capability, speed, and price comparisons.",
+        ),
+        (
+            "SWE-bench",
+            "https://www.swebench.com/",
+            "Software engineering benchmark leaderboard.",
+        ),
+        (
+            "METR",
+            "https://metr.org/",
+            "AI capability evaluations and task-completion research.",
+        ),
+        (
+            "MLPerf",
+            "https://mlcommons.org/benchmarks/",
+            "MLCommons training/inference benchmark suites.",
+        ),
+        (
+            "Epoch AI",
+            "https://epoch.ai/",
+            "AI trends, compute, benchmark, and model release data.",
+        ),
+    )
+
+    @classmethod
+    def _base_forecaster_specs(cls) -> list[ForecasterRoleSpec]:
+        """
+        Cheap, diverse first-pass ensemble with distinct reasoning roles.
+        GPT-5.5 is intentionally excluded and only used when this group disagrees.
+        """
+        return [
+            ForecasterRoleSpec(
+                name="Base-rate / outside-view forecaster",
+                llm=GeneralLlm(
+                    model=os.getenv(
+                        "BASE_RATE_FORECASTER_MODEL",
+                        "openrouter/deepseek/deepseek-v4-pro",
+                    ),
+                    temperature=0.25,
+                    timeout=240,
+                    allowed_tries=2,
+                ),
+                instructions=clean_indents(
+                    """
+                    Your primary role is the outside view.
+                    - Start from the best reference class, not the most vivid recent evidence.
+                    - Look for historical analogues, prior frequencies, base rates, and the status quo/no-change outcome.
+                    - State the base-rate prior before applying question-specific updates.
+                    - Be conservative about trend extrapolation unless the reference class supports it.
+                    - Still produce a complete forecast in the exact final format requested.
+                    """
+                ),
+            ),
+            ForecasterRoleSpec(
+                name="Inside-view / current-evidence forecaster",
+                llm=GeneralLlm(
+                    model=os.getenv(
+                        "INSIDE_VIEW_FORECASTER_MODEL",
+                        "openrouter/z-ai/glm-5.1",
+                    ),
+                    temperature=0.25,
+                    timeout=180,
+                    allowed_tries=2,
+                ),
+                instructions=clean_indents(
+                    """
+                    Your primary role is the inside view.
+                    - Focus on mechanisms, causal pathways, incentives, constraints, and latest evidence.
+                    - Identify recent developments, trend breaks, catalysts, and near-term watchpoints.
+                    - Explain which facts would move the forecast materially up/down or earlier/later.
+                    - Check whether current evidence is strong enough to overcome the base rate.
+                    - Still produce a complete forecast in the exact final format requested.
+                    """
+                ),
+            ),
+            ForecasterRoleSpec(
+                name="Market / structured-data interpreter",
+                llm=GeneralLlm(
+                    model=os.getenv(
+                        "MARKET_DATA_FORECASTER_MODEL",
+                        "openrouter/mistralai/mistral-large-2512",
+                    ),
+                    temperature=0.25,
+                    timeout=180,
+                    allowed_tries=2,
+                ),
+                instructions=clean_indents(
+                    """
+                    Your primary role is interpreting markets and structured data.
+                    - Map Kalshi, Polymarket, Manifold, FRED, SEC, polling, AI benchmark, and other direct evidence to the exact resolution criteria.
+                    - Distinguish direct evidence from merely similar markets/data.
+                    - Convert market prices or official values into forecast-relevant priors only when the mapping is defensible.
+                    - Flag caveats: liquidity, stale data, different resolution dates, different thresholds, revisions, and selection bias.
+                    - If no direct market/data evidence exists, say so and make a normal forecast from the remaining evidence.
+                    - Still produce a complete forecast in the exact final format requested.
+                    """
+                ),
+            ),
+        ]
+
+    @classmethod
+    def _base_forecaster_llms(cls) -> list[GeneralLlm]:
+        return [spec.llm for spec in cls._base_forecaster_specs()]
+
+    @classmethod
+    def _escalation_forecaster_spec(cls) -> ForecasterRoleSpec:
+        return ForecasterRoleSpec(
+            name="Stacker / skeptic adjudicator",
+            llm=GeneralLlm(
+                model=os.getenv(
+                    "ESCALATION_FORECASTER_MODEL", "openrouter/openai/gpt-5.5"
+                ),
+                temperature=0.2,
+                timeout=180,
+                allowed_tries=2,
+            ),
+            instructions=clean_indents(
+                """
+                Your role is the final adjudicator.
+                - Treat the cheaper model outputs as role-specific evidence, not independent votes.
+                - Red-team the resolution criteria, stale research, bad analogies, and market/data mismatches.
+                - Decide which role found the most resolution-relevant evidence and which assumptions should be discounted.
+                - Produce the final forecast only after weighing the outside view, inside view, and market/data view.
+                - Still use the exact final answer format requested.
+                """
+            ),
+        )
+
+    @classmethod
+    def _escalation_forecaster_llm(cls) -> GeneralLlm:
+        return cls._escalation_forecaster_spec().llm
+
+    @staticmethod
+    def _role_prompt(prompt: str, role_spec: ForecasterRoleSpec) -> str:
+        return clean_indents(
+            f"""
+            You are acting as the {role_spec.name}.
+
+            Role-specific instructions:
+            {role_spec.instructions}
+
+            ---
+
+            {prompt}
+            """
+        )
+
+    @classmethod
+    def _forecasting_checklist(cls) -> str:
+        return clean_indents(
+            """
+            Forecasting discipline:
+            - Restate the exact resolution criteria and check whether the question is already effectively resolved.
+            - Separate the outside view/base rate from the inside view/current evidence.
+            - Identify the most important cruxes and what would change your mind.
+            - Watch for bait-and-switch errors: answer the question as written, not a nearby easier question.
+            - Calibrate uncertainty: avoid both false precision and lazy 50/50 hedging.
+            - If markets, expert forecasts, polls, official data, or historical reference classes are relevant, weigh them explicitly.
+            """
+        )
+
+    async def _gather_ensemble_predictions(
+        self,
+        tasks: list[asyncio.Task[ReasonedPrediction[T]]],
+        question: MetaculusQuestion,
+    ) -> list[ReasonedPrediction[T]]:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        predictions: list[ReasonedPrediction[T]] = []
+        errors: list[str] = []
+        for result in results:
+            if isinstance(result, BaseException):
+                errors.append(repr(result))
+            else:
+                predictions.append(result)
+
+        if errors:
+            logger.warning(
+                "Ensemble members failed for URL %s: %s", question.page_url, errors
+            )
+        if len(predictions) < self._min_successful_ensemble_predictions:
+            raise RuntimeError(
+                f"All ensemble forecasters failed for {question.page_url}. Errors: {errors}"
+            )
+        return predictions
+
+    @staticmethod
+    def _combine_model_reasoning(predictions: list[ReasonedPrediction[T]]) -> str:
+        model_rationales = "\n\n".join(
+            f"## Role output {i + 1}\n{prediction.reasoning}"
+            for i, prediction in enumerate(predictions)
+        )
+        return clean_indents(
+            f"""
+            Ensemble forecast synthesized from {len(predictions)} successful role-specific forecasts.
+
+            {model_rationales}
+            """
+        )
+
+    @staticmethod
+    def _model_key_from_reasoning(
+        prediction: ReasonedPrediction[T], fallback: str
+    ) -> str:
+        for line in prediction.reasoning.splitlines():
+            if line.startswith("Model: "):
+                return line.removeprefix("Model: ").strip()
+        return fallback
+
+    @classmethod
+    def _group_predictions_by_model(
+        cls, predictions: list[ReasonedPrediction[T]]
+    ) -> dict[str, list[ReasonedPrediction[T]]]:
+        groups: dict[str, list[ReasonedPrediction[T]]] = {}
+        for index, prediction in enumerate(predictions):
+            model_key = cls._model_key_from_reasoning(
+                prediction, fallback=f"unknown-model-{index}"
+            )
+            groups.setdefault(model_key, []).append(prediction)
+        return groups
+
+    @staticmethod
+    def _same_model_role_reasoning(
+        model_key: str, predictions: list[ReasonedPrediction[T]]
+    ) -> str:
+        role_outputs = "\n\n".join(
+            f"### Same-model role pass {i + 1}\nPrediction: {prediction.prediction_value}\n\n{prediction.reasoning}"
+            for i, prediction in enumerate(predictions)
+        )
+        return clean_indents(
+            f"""
+            Same-model role bundle.
+            Model: {model_key}
+
+            These role passes use the same underlying model, so they are treated as lenses from one model family rather than independent votes.
+
+            {role_outputs}
+            """
+        )
+
+    @classmethod
+    def _collapse_same_model_binary_predictions(
+        cls, predictions: list[ReasonedPrediction[float]]
+    ) -> list[ReasonedPrediction[float]]:
+        collapsed: list[ReasonedPrediction[float]] = []
+        for model_key, model_predictions in cls._group_predictions_by_model(
+            predictions
+        ).items():
+            if len(model_predictions) == 1:
+                collapsed.append(model_predictions[0])
+                continue
+            collapsed.append(
+                ReasonedPrediction(
+                    prediction_value=cls._logit_mean_probability(
+                        [
+                            prediction.prediction_value
+                            for prediction in model_predictions
+                        ]
+                    ),
+                    reasoning=cls._same_model_role_reasoning(
+                        model_key, model_predictions
+                    ),
+                )
+            )
+        return collapsed
+
+    async def _collapse_same_model_multiple_choice_predictions(
+        self,
+        predictions: list[ReasonedPrediction[PredictedOptionList]],
+        question: MultipleChoiceQuestion,
+    ) -> list[ReasonedPrediction[PredictedOptionList]]:
+        collapsed: list[ReasonedPrediction[PredictedOptionList]] = []
+        for model_key, model_predictions in self._group_predictions_by_model(
+            predictions
+        ).items():
+            if len(model_predictions) == 1:
+                collapsed.append(model_predictions[0])
+                continue
+            prediction_value = await MultipleChoiceReport.aggregate_predictions(
+                [
+                    prediction.prediction_value
+                    for prediction in model_predictions
+                ],
+                question,
+            )
+            collapsed.append(
+                ReasonedPrediction(
+                    prediction_value=prediction_value,
+                    reasoning=self._same_model_role_reasoning(
+                        model_key, model_predictions
+                    ),
+                )
+            )
+        return collapsed
+
+    async def _collapse_same_model_numeric_predictions(
+        self,
+        predictions: list[ReasonedPrediction[NumericDistribution]],
+        question: NumericQuestion | DateQuestion,
+    ) -> list[ReasonedPrediction[NumericDistribution]]:
+        collapsed: list[ReasonedPrediction[NumericDistribution]] = []
+        for model_key, model_predictions in self._group_predictions_by_model(
+            predictions
+        ).items():
+            if len(model_predictions) == 1:
+                collapsed.append(model_predictions[0])
+                continue
+            prediction_value = await NumericReport.aggregate_predictions(
+                [
+                    prediction.prediction_value
+                    for prediction in model_predictions
+                ],
+                question,
+            )
+            collapsed.append(
+                ReasonedPrediction(
+                    prediction_value=prediction_value,
+                    reasoning=self._same_model_role_reasoning(
+                        model_key, model_predictions
+                    ),
+                )
+            )
+        return collapsed
+
+    @staticmethod
+    def _truncate_for_prompt(text: str, max_chars: int) -> str:
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars].rstrip() + "\n...[truncated]"
+
+    @staticmethod
+    def _env_flag(name: str, default: bool = False) -> bool:
+        raw_value = os.getenv(name)
+        if raw_value is None:
+            return default
+        return raw_value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    @staticmethod
+    def _env_float(name: str, default: float) -> float:
+        raw_value = os.getenv(name)
+        if raw_value is None:
+            return default
+        try:
+            return float(raw_value)
+        except ValueError:
+            logger.warning("Ignoring invalid float env var %s=%r", name, raw_value)
+            return default
+
+    @classmethod
+    def apply_runtime_config_from_env(cls) -> None:
+        cls._binary_escalation_spread = cls._env_float(
+            "BINARY_ESCALATION_SPREAD", cls._binary_escalation_spread
+        )
+        cls._multiple_choice_escalation_spread = cls._env_float(
+            "MULTIPLE_CHOICE_ESCALATION_SPREAD",
+            cls._multiple_choice_escalation_spread,
+        )
+        cls._numeric_escalation_range_fraction = cls._env_float(
+            "NUMERIC_ESCALATION_RANGE_FRACTION",
+            cls._numeric_escalation_range_fraction,
+        )
+        cls._numeric_escalation_relative_fraction = cls._env_float(
+            "NUMERIC_ESCALATION_RELATIVE_FRACTION",
+            cls._numeric_escalation_relative_fraction,
+        )
+
+    @staticmethod
+    def _question_text_blob(question: MetaculusQuestion) -> str:
+        parts = [
+            getattr(question, "question_text", ""),
+            getattr(question, "background_info", ""),
+            getattr(question, "resolution_criteria", ""),
+            getattr(question, "fine_print", ""),
+        ]
+        return "\n".join(str(part) for part in parts if part).lower()
+
+    @classmethod
+    def _official_data_topics(cls, question: MetaculusQuestion) -> list[str]:
+        question_blob = cls._question_text_blob(question)
+        return [
+            topic
+            for topic, keywords in cls._official_data_topic_keywords.items()
+            if any(keyword in question_blob for keyword in keywords)
+        ]
+
+    @classmethod
+    def _should_run_high_value_deep_research(
+        cls, question: MetaculusQuestion
+    ) -> bool:
+        if cls._env_flag("DEEP_RESEARCH_ON_ALL_QUESTIONS", False):
+            return True
+        if not cls._env_flag("ENABLE_DEEP_RESEARCH_ON_HIGH_VALUE", False):
+            return False
+        question_blob = cls._question_text_blob(question)
+        configured_keywords = os.getenv(
+            "HIGH_VALUE_RESEARCH_KEYWORDS",
+            cls._default_high_value_deep_research_keywords,
+        )
+        keywords = [
+            keyword.strip().lower()
+            for keyword in configured_keywords.split(",")
+            if keyword.strip()
+        ]
+        return any(keyword in question_blob for keyword in keywords)
+
+    @classmethod
+    def _deep_research_llm(cls) -> GeneralLlm | None:
+        override_model = os.getenv("DEEP_RESEARCH_MODEL", "").strip()
+        if override_model:
+            return GeneralLlm(
+                model=override_model,
+                temperature=0.1,
+                timeout=360,
+                allowed_tries=2,
+            )
+
+        provider = os.getenv("DEEP_RESEARCH_PROVIDER", "auto").strip().lower()
+        if provider in {"auto", "perplexity", "sonar"}:
+            if os.getenv("PERPLEXITY_API_KEY"):
+                return GeneralLlm(
+                    model=os.getenv("PERPLEXITY_DEEP_RESEARCH_MODEL", "perplexity/sonar-pro"),
+                    temperature=0.1,
+                    timeout=360,
+                    allowed_tries=2,
+                    web_search_options={"search_context_size": "high"},
+                    reasoning_effort="high",
+                )
+            if os.getenv("OPENROUTER_API_KEY"):
+                return GeneralLlm(
+                    model=os.getenv(
+                        "OPENROUTER_PERPLEXITY_DEEP_RESEARCH_MODEL",
+                        "openrouter/perplexity/sonar-pro",
+                    ),
+                    temperature=0.1,
+                    timeout=360,
+                    allowed_tries=2,
+                    web_search_options={"search_context_size": "high"},
+                    reasoning_effort="high",
+                )
+
+        if provider in {"auto", "exa"} and os.getenv("EXA_API_KEY"):
+            return GeneralLlm(
+                model=os.getenv("EXA_DEEP_RESEARCH_MODEL", "exa/exa"),
+                temperature=0.1,
+                timeout=360,
+                allowed_tries=2,
+            )
+
+        return None
+
+    @classmethod
+    def _cache_ttl_seconds(cls) -> int:
+        raw_value = os.getenv("DIRECT_EVIDENCE_CACHE_HOURS", "6")
+        try:
+            return max(0, int(float(raw_value) * 3600))
+        except ValueError:
+            return 6 * 3600
+
+    @classmethod
+    def _provider_cache_key(
+        cls, provider: str, question: MetaculusQuestion, extra: str = ""
+    ) -> str:
+        question_id = getattr(question, "id", None) or getattr(
+            question, "id_of_post", ""
+        )
+        key_payload = json.dumps(
+            {
+                "provider": provider,
+                "question_id": question_id,
+                "question": getattr(question, "question_text", ""),
+                "extra": extra,
+            },
+            sort_keys=True,
+        )
+        return hashlib.sha256(key_payload.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _read_cached_evidence(cls, cache_key: str) -> list[EvidenceItem] | None:
+        if not cls._env_flag("ENABLE_DIRECT_EVIDENCE_CACHE", True):
+            return None
+        ttl_seconds = cls._cache_ttl_seconds()
+        if ttl_seconds <= 0:
+            return None
+        cache_path = cls._research_cache_dir / f"{cache_key}.json"
+        if not cache_path.exists():
+            return None
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            if time.time() - payload.get("created_at", 0) > ttl_seconds:
+                return None
+            return [EvidenceItem(**item) for item in payload.get("items", [])]
+        except Exception as error:
+            logger.warning("Failed to read direct-evidence cache %s: %r", cache_key, error)
+            return None
+
+    @classmethod
+    def _write_cached_evidence(
+        cls, cache_key: str, evidence_items: list[EvidenceItem]
+    ) -> None:
+        if not cls._env_flag("ENABLE_DIRECT_EVIDENCE_CACHE", True):
+            return
+        try:
+            cls._research_cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_path = cls._research_cache_dir / f"{cache_key}.json"
+            cache_payload = {
+                "created_at": time.time(),
+                "items": [asdict(item) for item in evidence_items],
+            }
+            cache_path.write_text(json.dumps(cache_payload, indent=2), encoding="utf-8")
+        except Exception as error:
+            logger.warning("Failed to write direct-evidence cache %s: %r", cache_key, error)
+
+    @classmethod
+    async def _cached_evidence_fetch(
+        cls,
+        provider: str,
+        question: MetaculusQuestion,
+        fetcher: Any,
+        extra: str = "",
+    ) -> list[EvidenceItem]:
+        cache_key = cls._provider_cache_key(provider, question, extra)
+        cached = cls._read_cached_evidence(cache_key)
+        if cached is not None:
+            return cached
+        evidence_items = await fetcher()
+        cls._write_cached_evidence(cache_key, evidence_items)
+        return evidence_items
+
+    @staticmethod
+    def _safe_json_get(url: str, **kwargs: Any) -> dict[str, Any] | list[Any]:
+        response = requests.get(url, timeout=kwargs.pop("timeout", 20), **kwargs)
+        response.raise_for_status()
+        return response.json()
+
+    @classmethod
+    async def _http_get_json(
+        cls,
+        url: str,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: int = 20,
+    ) -> dict[str, Any] | list[Any]:
+        return await asyncio.to_thread(
+            cls._safe_json_get,
+            url,
+            params=params,
+            headers=headers,
+            timeout=timeout,
+        )
+
+    @classmethod
+    def _question_terms(cls, question: MetaculusQuestion) -> set[str]:
+        question_blob = cls._question_text_blob(question)
+        words = set(re.findall(r"[a-zA-Z][a-zA-Z0-9\-]{2,}", question_blob))
+        return {
+            word.lower()
+            for word in words
+            if len(word) > 3 and word.lower() not in cls._stop_words
+        }
+
+    @classmethod
+    def _relevance_score(cls, candidate_text: str, question: MetaculusQuestion) -> float:
+        terms = cls._question_terms(question)
+        if not terms:
+            return 0.0
+        candidate_words = set(
+            word.lower()
+            for word in re.findall(r"[a-zA-Z][a-zA-Z0-9\-]{2,}", candidate_text)
+        )
+        matches = terms & candidate_words
+        return len(matches) / max(len(terms), 1)
+
+    @classmethod
+    def _directness_from_score(cls, score: float) -> str:
+        if score >= 0.22:
+            return "direct"
+        if score >= 0.10:
+            return "similar"
+        return "weak"
+
+    @staticmethod
+    def _normalise_market_probability(value: Any) -> float | None:
+        if value is None or value == "":
+            return None
+        try:
+            if isinstance(value, str):
+                value = value.strip().replace("$", "").replace("%", "")
+            probability = float(value)
+        except (TypeError, ValueError):
+            return None
+        if probability > 1:
+            probability /= 100
+        if probability < 0 or probability > 1:
+            return None
+        return probability
+
+    @staticmethod
+    def _parse_jsonish_list(value: Any) -> list[Any]:
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                return parsed if isinstance(parsed, list) else []
+            except json.JSONDecodeError:
+                return []
+        return []
+
+    @staticmethod
+    def _format_probability(probability: float | None) -> str:
+        if probability is None:
+            return "n/a"
+        return f"{probability:.1%}"
+
+    @classmethod
+    def _format_evidence_items(cls, evidence_items: list[EvidenceItem]) -> str:
+        if not evidence_items:
+            return ""
+        lines: list[str] = []
+        for item in evidence_items:
+            probability = (
+                f" | implied probability {cls._format_probability(item.probability)}"
+                if item.probability is not None
+                else ""
+            )
+            value = f" | value {item.value} {item.unit}".rstrip() if item.value else ""
+            date = f" | date {item.date}" if item.date else ""
+            url = f" | {item.url}" if item.url else ""
+            caveats = f" Caveats: {item.caveats}" if item.caveats else ""
+            lines.append(
+                f"- [{item.provider} / {item.directness}] {item.title}{probability}{value}{date}{url}. "
+                f"{item.summary}{caveats}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _clamp_probability(probability: float) -> float:
+        return max(0.01, min(0.99, probability))
+
+    @classmethod
+    def _logit_mean_probability(cls, probabilities: list[float]) -> float:
+        logits = [
+            math.log(cls._clamp_probability(prob) / (1 - cls._clamp_probability(prob)))
+            for prob in probabilities
+        ]
+        mean_logit = statistics.mean(logits)
+        return cls._clamp_probability(1 / (1 + math.exp(-mean_logit)))
+
+    @classmethod
+    def _should_escalate_binary(
+        cls, predictions: list[ReasonedPrediction[float]]
+    ) -> bool:
+        if len(predictions) < 2:
+            return True
+        probabilities = [prediction.prediction_value for prediction in predictions]
+        return max(probabilities) - min(probabilities) >= cls._binary_escalation_spread
+
+    @classmethod
+    def _should_escalate_multiple_choice(
+        cls, predictions: list[ReasonedPrediction[PredictedOptionList]]
+    ) -> bool:
+        if len(predictions) < 2:
+            return True
+        option_names = predictions[0].prediction_value.to_dict().keys()
+        for option_name in option_names:
+            probabilities = [
+                prediction.prediction_value.to_dict()[option_name]
+                for prediction in predictions
+            ]
+            if (
+                max(probabilities) - min(probabilities)
+                >= cls._multiple_choice_escalation_spread
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _value_at_percentile(
+        distribution: NumericDistribution, target_percentile: float
+    ) -> float:
+        percentiles = sorted(
+            distribution.declared_percentiles, key=lambda item: item.percentile
+        )
+        for percentile in percentiles:
+            if math.isclose(percentile.percentile, target_percentile, abs_tol=1e-6):
+                return percentile.value
+        for lower, upper in zip(percentiles, percentiles[1:]):
+            if lower.percentile <= target_percentile <= upper.percentile:
+                span = upper.percentile - lower.percentile
+                if span <= 0:
+                    return lower.value
+                weight = (target_percentile - lower.percentile) / span
+                return lower.value + weight * (upper.value - lower.value)
+        return percentiles[min(range(len(percentiles)), key=lambda i: abs(percentiles[i].percentile - target_percentile))].value
+
+    @classmethod
+    def _should_escalate_numeric(
+        cls,
+        predictions: list[ReasonedPrediction[NumericDistribution]],
+        question: NumericQuestion | DateQuestion,
+    ) -> bool:
+        if len(predictions) < 2:
+            return True
+        medians = [
+            cls._value_at_percentile(prediction.prediction_value, 0.5)
+            for prediction in predictions
+        ]
+        spread = max(medians) - min(medians)
+        center = abs(statistics.median(medians))
+        if isinstance(question, DateQuestion):
+            range_width = abs(
+                question.upper_bound.timestamp() - question.lower_bound.timestamp()
+            )
+        else:
+            range_width = abs(question.upper_bound - question.lower_bound)
+        range_disagreement = (
+            range_width > 0
+            and spread / range_width >= cls._numeric_escalation_range_fraction
+        )
+        relative_disagreement = (
+            center > 1 and spread / center >= cls._numeric_escalation_relative_fraction
+        )
+        return range_disagreement or relative_disagreement
+
+    @staticmethod
+    def _build_escalation_prompt(
+        prompt: str,
+        predictions: list[ReasonedPrediction[T]],
+        targeted_research: str = "",
+    ) -> str:
+        model_outputs = "\n\n".join(
+            f"## Cheap role output {i + 1}\nPrediction: {prediction.prediction_value}\n\nReasoning:\n{prediction.reasoning}"
+            for i, prediction in enumerate(predictions)
+        )
+        targeted_research_section = (
+            clean_indents(
+                f"""
+                Additional targeted research gathered after the cheap ensemble disagreed:
+                {targeted_research}
+                """
+            )
+            if targeted_research.strip()
+            else ""
+        )
+        return clean_indents(
+            f"""
+            {prompt}
+
+            ---
+
+            Escalation context:
+            The cheaper first-pass role ensemble either disagreed materially or had too few successful members.
+            Critically review their forecasts below. Do not average blindly; decide which role found the strongest
+            assumptions, which evidence is most resolution-relevant, and whether any role appears to have answered
+            the wrong question.
+
+            {targeted_research_section}
+
+            {model_outputs}
+
+            Now produce your own final forecast in the exact required format from the original instructions.
+            """
+        )
+
+    async def _build_targeted_escalation_prompt(
+        self,
+        question: MetaculusQuestion,
+        prompt: str,
+        predictions: list[ReasonedPrediction[T]],
+    ) -> str:
+        targeted_research = await self._run_disagreement_targeted_research(
+            question, predictions
+        )
+        return self._build_escalation_prompt(prompt, predictions, targeted_research)
 
     ##################################### RESEARCH #####################################
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
-            research = ""
             researcher = self.get_llm("researcher")
 
-            prompt = clean_indents(
-                f"""
-                You are an assistant to a superforecaster.
-                The superforecaster will give you a question they intend to forecast on.
-                To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
-                You do not produce forecasts yourself.
+            prompt = self._build_structured_research_prompt(question)
 
-                Question:
-                {question.question_text}
-
-                This question's outcome will be determined by the specific criteria below:
-                {question.resolution_criteria}
-
-                {question.fine_print}
-                """
-            )
-
-            try:
-                if isinstance(researcher, GeneralLlm):
-                    research = await researcher.invoke(prompt)
-                elif (
-                    researcher == "asknews/news-summaries"
-                    or researcher == "asknews/deep-research/low-depth"
-                    or researcher == "asknews/deep-research/medium-depth"
-                    or researcher == "asknews/deep-research/high-depth"
-                ):
-                    research = await AskNewsSearcher().call_preconfigured_version(
-                        researcher, prompt
+            research_tasks = [
+                (
+                    "AskNews / configured research",
+                    self._run_configured_researcher(researcher, prompt, question),
+                ),
+                (
+                    "Supplemental web/source research",
+                    self._run_supplemental_web_research(question),
+                ),
+            ]
+            if self._env_flag("ENABLE_DIRECT_STRUCTURED_RESEARCH", True):
+                research_tasks.append(
+                    (
+                        "Direct API / structured evidence",
+                        self._run_direct_structured_research(question),
                     )
-                elif researcher.startswith("smart-searcher"):
-                    model_name = researcher.removeprefix("smart-searcher/")
-                    searcher = SmartSearcher(
-                        model=model_name,
-                        temperature=0,
-                        num_searches_to_run=2,
-                        num_sites_per_search=10,
-                        use_advanced_filters=False,
-                    )
-                    research = await searcher.invoke(prompt)
-                elif not researcher or researcher == "None" or researcher == "no_research":
-                    research = ""
-                else:
-                    research = await self.get_llm("researcher", "llm").invoke(prompt)
-            except Exception as e:
-                logger.warning(
-                    f"Research failed for {question.page_url}, proceeding without research: {e}"
                 )
-                research = ""
+            if self._env_flag("ENABLE_MARKET_PRIOR_RESEARCH", True):
+                research_tasks.append(
+                    (
+                        "Market-prior collector",
+                        self._run_market_prior_research(question),
+                    )
+                )
+            official_topics = self._official_data_topics(question)
+            if (
+                self._env_flag("ENABLE_OFFICIAL_DATA_RESEARCH", True)
+                and official_topics
+            ):
+                research_tasks.append(
+                    (
+                        "Official data router",
+                        self._run_official_data_research(question, official_topics),
+                    )
+                )
+            if self._should_run_high_value_deep_research(question):
+                research_tasks.append(
+                    (
+                        "Optional deep research",
+                        self._run_optional_deep_research(
+                            question,
+                            focus="High-value question research pass requested by configuration.",
+                            reason="high-value",
+                        ),
+                    )
+                )
+            results = await asyncio.gather(
+                *(task for _, task in research_tasks), return_exceptions=True
+            )
+            research_sections: list[str] = []
+            for (section_name, _), result in zip(research_tasks, results):
+                if isinstance(result, BaseException):
+                    logger.warning(
+                        "Research section %s failed for URL %s: %r",
+                        section_name,
+                        question.page_url,
+                        result,
+                    )
+                elif result.strip():
+                    research_sections.append(f"## {section_name}\n{result}")
+
+            research = "\n\n".join(research_sections)
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
+
+    @staticmethod
+    def _build_structured_research_prompt(question: MetaculusQuestion) -> str:
+        return clean_indents(
+            f"""
+            You are a research assistant supporting a forecasting bot. Gather evidence only; do not make a final forecast.
+
+            Produce a concise evidence memo with exactly these headings:
+            ## Resolution check
+            - Explain the exact event, threshold, dates, and source of truth.
+            - Note whether the question already appears resolved under the criteria.
+
+            ## Current state
+            - Give the latest measured value, status, or public fact pattern.
+            - Prefer official or primary sources when available.
+
+            ## Base rates and reference classes
+            - Give historical frequency, analogous cases, or a reasonable outside view.
+            - If no good base rate exists, say what proxy you used.
+
+            ## Trend and drivers
+            - Summarize the main forces pushing the outcome up/down or earlier/later.
+
+            ## Market and expert priors
+            - Look for relevant prediction markets, forecasts, polls, analyst estimates, or consensus views.
+            - Include Kalshi, Polymarket, Manifold, Metaculus/community forecasts, or similar markets when relevant and allowed.
+
+            ## Counterevidence
+            - Give the strongest reasons the obvious answer could be wrong.
+
+            ## Cruxes to verify
+            - List 2-4 factual cruxes that would most change a forecast.
+
+            Include source names and URLs where available. Keep the memo compact and factual.
+
+            Question:
+            {question.question_text}
+
+            Background:
+            {question.background_info}
+
+            Resolution criteria:
+            {question.resolution_criteria}
+
+            Fine print:
+            {question.fine_print}
+            """
+        )
+
+    async def _run_configured_researcher(
+        self,
+        researcher: str | GeneralLlm,
+        prompt: str,
+        question: MetaculusQuestion,
+    ) -> str:
+        if isinstance(researcher, GeneralLlm):
+            return await researcher.invoke(prompt)
+        elif (
+            researcher == "asknews/news-summaries"
+            or researcher == "asknews/deep-research/low-depth"
+            or researcher == "asknews/deep-research/medium-depth"
+            or researcher == "asknews/deep-research/high-depth"
+        ):
+            asknews_query = (
+                question.question_text
+                if researcher == "asknews/news-summaries"
+                else prompt
+            )
+            return await AskNewsSearcher().call_preconfigured_version(
+                researcher, asknews_query
+            )
+        elif researcher.startswith("smart-searcher"):
+            model_name = researcher.removeprefix("smart-searcher/")
+            searcher = SmartSearcher(
+                model=model_name,
+                temperature=0,
+                num_searches_to_run=2,
+                num_sites_per_search=10,
+                use_advanced_filters=False,
+            )
+            return await searcher.invoke(prompt)
+        elif not researcher or researcher == "None" or researcher == "no_research":
+            return ""
+        else:
+            return await self.get_llm("researcher", "llm").invoke(prompt)
+
+    async def _run_supplemental_web_research(
+        self, question: MetaculusQuestion
+    ) -> str:
+        if not os.getenv("OPENROUTER_API_KEY"):
+            return ""
+        supplemental_prompt = clean_indents(
+            f"""
+            Build a structured forecasting research memo. Search broadly, but only report evidence that matters for the exact resolution criteria.
+
+            Required sections:
+            ## Resolution check
+            ## Current state
+            ## Base rates and reference classes
+            ## Trend and drivers
+            ## Market and expert priors
+            ## Counterevidence
+            ## Cruxes to verify
+
+            Prioritize official sources, primary data, prediction markets or expert forecasts when allowed by the tournament, and recent reporting.
+            Include source names and URLs when available. If a section has no strong evidence, say so briefly. Do not make a final forecast.
+
+            Question:
+            {question.question_text}
+
+            Background:
+            {question.background_info}
+
+            Resolution criteria:
+            {question.resolution_criteria}
+
+            Fine print:
+            {question.fine_print}
+            """
+        )
+        searcher = SmartSearcher(
+            model="openrouter/mistralai/mistral-large-2512",
+            temperature=0,
+            num_searches_to_run=3,
+            num_sites_per_search=8,
+            use_advanced_filters=False,
+        )
+        return await searcher.invoke(supplemental_prompt)
+
+    async def _run_direct_structured_research(
+        self, question: MetaculusQuestion
+    ) -> str:
+        provider_tasks: list[tuple[str, asyncio.Task[list[EvidenceItem]]]] = []
+        topics = self._official_data_topics(question)
+
+        if self._env_flag("ENABLE_DIRECT_MARKET_APIS", True):
+            provider_tasks.extend(
+                [
+                    (
+                        "Kalshi",
+                        asyncio.create_task(self._fetch_cached_kalshi_markets(question)),
+                    ),
+                    (
+                        "Polymarket",
+                        asyncio.create_task(
+                            self._fetch_cached_polymarket_markets(question)
+                        ),
+                    ),
+                    (
+                        "Manifold",
+                        asyncio.create_task(
+                            self._fetch_cached_manifold_markets(question)
+                        ),
+                    ),
+                ]
+            )
+        if "economic" in topics and os.getenv("FRED_API_KEY"):
+            provider_tasks.append(
+                ("FRED", asyncio.create_task(self._fetch_cached_fred_series(question)))
+            )
+        if "finance" in topics and self._env_flag("ENABLE_SEC_EDGAR_RESEARCH", True):
+            provider_tasks.append(
+                (
+                    "SEC EDGAR",
+                    asyncio.create_task(self._fetch_cached_sec_edgar(question)),
+                )
+            )
+        if "polling" in topics and self._env_flag("ENABLE_FIVETHIRTYEIGHT_POLLS", True):
+            provider_tasks.append(
+                (
+                    "FiveThirtyEight polling data",
+                    asyncio.create_task(
+                        self._fetch_cached_fivethirtyeight_polls(question)
+                    ),
+                )
+            )
+        if "geopolitical" in topics and self._env_flag("ENABLE_ACLED_RESEARCH", True):
+            provider_tasks.append(
+                ("ACLED", asyncio.create_task(self._fetch_cached_acled_events(question)))
+            )
+        if "ai" in topics:
+            provider_tasks.append(
+                (
+                    "AI benchmark registry",
+                    asyncio.create_task(self._fetch_ai_benchmark_registry(question)),
+                )
+            )
+
+        if not provider_tasks:
+            return ""
+
+        results = await asyncio.gather(
+            *(task for _, task in provider_tasks), return_exceptions=True
+        )
+        evidence_items: list[EvidenceItem] = []
+        for (provider_name, _), result in zip(provider_tasks, results):
+            if isinstance(result, BaseException):
+                logger.warning(
+                    "Direct provider %s failed for URL %s: %r",
+                    provider_name,
+                    question.page_url,
+                    result,
+                )
+                continue
+            evidence_items.extend(result)
+
+        evidence_items = sorted(
+            evidence_items,
+            key=lambda item: {"direct": 0, "similar": 1, "weak": 2}.get(
+                item.directness, 3
+            ),
+        )
+        evidence_items = evidence_items[: int(os.getenv("DIRECT_EVIDENCE_MAX_ITEMS", "20"))]
+        if not evidence_items:
+            return ""
+
+        raw_evidence = self._format_evidence_items(evidence_items)
+        if not self._env_flag("ENABLE_DIRECT_EVIDENCE_SYNTHESIS", True):
+            return raw_evidence
+        synthesis = await self._synthesize_direct_evidence(question, evidence_items)
+        return clean_indents(
+            f"""
+            ## Raw structured evidence
+            {raw_evidence}
+
+            ## Structured evidence synthesis
+            {synthesis}
+            """
+        )
+
+    async def _synthesize_direct_evidence(
+        self, question: MetaculusQuestion, evidence_items: list[EvidenceItem]
+    ) -> str:
+        prompt = clean_indents(
+            f"""
+            Synthesize these structured evidence items for a forecaster.
+            Do not produce a final forecast.
+
+            Explain:
+            - Which items are direct evidence for the exact resolution criteria.
+            - Which items are only analogous/contextual.
+            - Any market-implied probabilities and caveats.
+            - Any source-of-truth data values and update/revision caveats.
+
+            Question:
+            {question.question_text}
+
+            Resolution criteria:
+            {question.resolution_criteria}
+
+            Evidence JSON:
+            {json.dumps([asdict(item) for item in evidence_items], indent=2)[:12000]}
+            """
+        )
+        try:
+            return await self.get_llm("summarizer", "llm").invoke(prompt)
+        except Exception as error:
+            logger.warning(
+                "Direct evidence synthesis failed for URL %s: %r",
+                question.page_url,
+                error,
+            )
+            return "Synthesis unavailable; use raw structured evidence above."
+
+    async def _fetch_cached_kalshi_markets(
+        self, question: MetaculusQuestion
+    ) -> list[EvidenceItem]:
+        return await self._cached_evidence_fetch(
+            "kalshi", question, lambda: self._fetch_kalshi_markets(question)
+        )
+
+    async def _fetch_kalshi_markets(
+        self, question: MetaculusQuestion
+    ) -> list[EvidenceItem]:
+        base_url = os.getenv(
+            "KALSHI_API_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2"
+        ).rstrip("/")
+        try:
+            payload = await self._http_get_json(
+                f"{base_url}/markets",
+                params={"status": "open", "limit": 1000},
+                timeout=25,
+            )
+        except Exception as error:
+            logger.warning("Kalshi market fetch failed: %r", error)
+            return []
+        markets = payload.get("markets", []) if isinstance(payload, dict) else []
+        evidence_items: list[EvidenceItem] = []
+        for market in markets:
+            title = str(market.get("title") or market.get("subtitle") or "")
+            candidate_text = " ".join(
+                str(market.get(key, ""))
+                for key in ("title", "subtitle", "rules_primary", "category")
+            )
+            score = self._relevance_score(candidate_text, question)
+            if score < 0.08:
+                continue
+            yes_bid = self._normalise_market_probability(market.get("yes_bid"))
+            yes_ask = self._normalise_market_probability(market.get("yes_ask"))
+            last_price = self._normalise_market_probability(market.get("last_price"))
+            probability_values = [
+                value for value in (yes_bid, yes_ask, last_price) if value is not None
+            ]
+            probability = (
+                statistics.mean(probability_values) if probability_values else None
+            )
+            ticker = market.get("ticker", "")
+            url = f"https://kalshi.com/markets/{ticker}" if ticker else "https://kalshi.com/markets"
+            evidence_items.append(
+                EvidenceItem(
+                    source="Kalshi",
+                    provider="kalshi",
+                    title=title or str(ticker),
+                    url=url,
+                    retrieved_at=datetime.now(timezone.utc).isoformat(),
+                    summary=(
+                        f"Open Kalshi market matched by local text relevance. "
+                        f"Volume: {market.get('volume', 'n/a')}; open interest: {market.get('open_interest', 'n/a')}."
+                    ),
+                    value=f"yes_bid={yes_bid}, yes_ask={yes_ask}, last={last_price}",
+                    probability=probability,
+                    date=str(market.get("close_time") or market.get("expiration_time") or ""),
+                    directness=self._directness_from_score(score),
+                    caveats="Kalshi market may not match Metaculus resolution exactly; verify title/rules.",
+                    raw={
+                        key: market.get(key)
+                        for key in (
+                            "ticker",
+                            "title",
+                            "yes_bid",
+                            "yes_ask",
+                            "last_price",
+                            "volume",
+                            "open_interest",
+                            "close_time",
+                        )
+                    },
+                )
+            )
+        return evidence_items[: self._direct_evidence_max_items_per_provider]
+
+    async def _fetch_cached_polymarket_markets(
+        self, question: MetaculusQuestion
+    ) -> list[EvidenceItem]:
+        return await self._cached_evidence_fetch(
+            "polymarket", question, lambda: self._fetch_polymarket_markets(question)
+        )
+
+    async def _fetch_polymarket_markets(
+        self, question: MetaculusQuestion
+    ) -> list[EvidenceItem]:
+        gamma_url = os.getenv(
+            "POLYMARKET_GAMMA_MARKETS_URL", "https://gamma-api.polymarket.com/markets"
+        )
+        try:
+            payload = await self._http_get_json(
+                gamma_url,
+                params={"active": "true", "closed": "false", "limit": 500},
+                timeout=25,
+            )
+        except Exception as error:
+            logger.warning("Polymarket market fetch failed: %r", error)
+            return []
+        markets = payload if isinstance(payload, list) else payload.get("markets", [])
+        evidence_items: list[EvidenceItem] = []
+        for market in markets:
+            if not isinstance(market, dict):
+                continue
+            title = str(market.get("question") or market.get("title") or "")
+            candidate_text = " ".join(
+                str(market.get(key, ""))
+                for key in ("question", "title", "description", "category")
+            )
+            score = self._relevance_score(candidate_text, question)
+            if score < 0.08:
+                continue
+            outcome_prices = self._parse_jsonish_list(market.get("outcomePrices"))
+            outcomes = self._parse_jsonish_list(market.get("outcomes"))
+            probability = None
+            if outcome_prices:
+                yes_index = 0
+                if outcomes:
+                    for index, outcome in enumerate(outcomes):
+                        if str(outcome).strip().lower() in {"yes", "true"}:
+                            yes_index = index
+                            break
+                if yes_index < len(outcome_prices):
+                    probability = self._normalise_market_probability(
+                        outcome_prices[yes_index]
+                    )
+            slug = market.get("slug") or market.get("marketSlug") or ""
+            url = f"https://polymarket.com/market/{slug}" if slug else "https://polymarket.com/markets"
+            evidence_items.append(
+                EvidenceItem(
+                    source="Polymarket",
+                    provider="polymarket",
+                    title=title,
+                    url=url,
+                    retrieved_at=datetime.now(timezone.utc).isoformat(),
+                    summary=(
+                        f"Active Polymarket market matched by local text relevance. "
+                        f"Volume: {market.get('volume', 'n/a')}; liquidity: {market.get('liquidity', 'n/a')}."
+                    ),
+                    value=f"outcomes={outcomes}, outcomePrices={outcome_prices}",
+                    probability=probability,
+                    date=str(market.get("endDate") or market.get("end_date") or ""),
+                    directness=self._directness_from_score(score),
+                    caveats="Polymarket outcomes may map imperfectly to Metaculus criteria; check market rules.",
+                    raw={
+                        key: market.get(key)
+                        for key in (
+                            "id",
+                            "question",
+                            "slug",
+                            "outcomes",
+                            "outcomePrices",
+                            "volume",
+                            "liquidity",
+                            "endDate",
+                        )
+                    },
+                )
+            )
+        return evidence_items[: self._direct_evidence_max_items_per_provider]
+
+    async def _fetch_cached_manifold_markets(
+        self, question: MetaculusQuestion
+    ) -> list[EvidenceItem]:
+        return await self._cached_evidence_fetch(
+            "manifold", question, lambda: self._fetch_manifold_markets(question)
+        )
+
+    async def _fetch_manifold_markets(
+        self, question: MetaculusQuestion
+    ) -> list[EvidenceItem]:
+        search_terms = self._market_search_query(question)
+        try:
+            payload = await self._http_get_json(
+                "https://api.manifold.markets/v0/search-markets",
+                params={"term": search_terms, "limit": 20},
+                timeout=20,
+            )
+        except Exception as error:
+            logger.warning("Manifold market fetch failed: %r", error)
+            return []
+        markets = payload if isinstance(payload, list) else payload.get("markets", [])
+        evidence_items: list[EvidenceItem] = []
+        for market in markets:
+            if not isinstance(market, dict):
+                continue
+            title = str(market.get("question") or market.get("title") or "")
+            candidate_text = " ".join(
+                str(market.get(key, ""))
+                for key in ("question", "description", "textDescription", "outcomeType")
+            )
+            score = self._relevance_score(candidate_text, question)
+            if score < 0.06:
+                continue
+            probability = self._normalise_market_probability(market.get("probability"))
+            url = market.get("url") or (
+                f"https://manifold.markets/{market.get('creatorUsername', '')}/{market.get('slug', '')}"
+                if market.get("slug")
+                else "https://manifold.markets/"
+            )
+            evidence_items.append(
+                EvidenceItem(
+                    source="Manifold",
+                    provider="manifold",
+                    title=title,
+                    url=str(url),
+                    retrieved_at=datetime.now(timezone.utc).isoformat(),
+                    summary=(
+                        f"Manifold market search result for '{search_terms}'. "
+                        f"Volume/liquidity: {market.get('volume', market.get('volume24Hours', 'n/a'))}."
+                    ),
+                    probability=probability,
+                    date=str(market.get("closeTime") or ""),
+                    directness=self._directness_from_score(score),
+                    caveats="Manifold is often useful for priors but may be thinly traded or community-driven.",
+                    raw={
+                        key: market.get(key)
+                        for key in (
+                            "id",
+                            "question",
+                            "probability",
+                            "url",
+                            "slug",
+                            "volume",
+                            "closeTime",
+                            "outcomeType",
+                        )
+                    },
+                )
+            )
+        return evidence_items[: self._direct_evidence_max_items_per_provider]
+
+    @classmethod
+    def _market_search_query(cls, question: MetaculusQuestion) -> str:
+        question_text = getattr(question, "question_text", "")
+        cleaned = re.sub(r"\b(will|by|before|after|resolve|happen|there|be)\b", " ", question_text, flags=re.IGNORECASE)
+        cleaned = re.sub(r"[^a-zA-Z0-9 \-]", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned[:140] or question_text[:140]
+
+    async def _fetch_cached_fred_series(
+        self, question: MetaculusQuestion
+    ) -> list[EvidenceItem]:
+        series_ids = self._fred_series_for_question(question)
+        if not series_ids:
+            return []
+        extra = ",".join(series_id for series_id, _ in series_ids)
+        return await self._cached_evidence_fetch(
+            "fred", question, lambda: self._fetch_fred_series(question, series_ids), extra
+        )
+
+    @classmethod
+    def _fred_series_for_question(
+        cls, question: MetaculusQuestion
+    ) -> list[tuple[str, str]]:
+        question_blob = cls._question_text_blob(question)
+        matches: list[tuple[str, str]] = []
+        for keyword, series_info in cls._fred_series_by_keyword.items():
+            if keyword in question_blob and series_info not in matches:
+                matches.append(series_info)
+        return matches[:4]
+
+    async def _fetch_fred_series(
+        self,
+        question: MetaculusQuestion,
+        series_ids: list[tuple[str, str]],
+    ) -> list[EvidenceItem]:
+        api_key = os.getenv("FRED_API_KEY")
+        if not api_key:
+            return []
+        evidence_items: list[EvidenceItem] = []
+        for series_id, series_name in series_ids:
+            try:
+                payload = await self._http_get_json(
+                    "https://api.stlouisfed.org/fred/series/observations",
+                    params={
+                        "series_id": series_id,
+                        "api_key": api_key,
+                        "file_type": "json",
+                        "sort_order": "desc",
+                        "limit": 3,
+                    },
+                    timeout=20,
+                )
+            except Exception as error:
+                logger.warning("FRED fetch failed for %s: %r", series_id, error)
+                continue
+            observations = (
+                payload.get("observations", []) if isinstance(payload, dict) else []
+            )
+            latest = next(
+                (
+                    observation
+                    for observation in observations
+                    if observation.get("value") not in {None, "."}
+                ),
+                None,
+            )
+            if latest is None:
+                continue
+            evidence_items.append(
+                EvidenceItem(
+                    source="FRED",
+                    provider="fred",
+                    title=f"{series_name} ({series_id})",
+                    url=f"https://fred.stlouisfed.org/series/{series_id}",
+                    retrieved_at=datetime.now(timezone.utc).isoformat(),
+                    summary="Latest FRED observation for a mapped economic series.",
+                    value=str(latest.get("value", "")),
+                    unit="series units",
+                    date=str(latest.get("date", "")),
+                    directness="similar",
+                    caveats="Check units, release timing, revisions, and whether this exact series matches the resolution criteria.",
+                    raw={"series_id": series_id, "latest": latest},
+                )
+            )
+        return evidence_items[: self._direct_evidence_max_items_per_provider]
+
+    async def _fetch_cached_sec_edgar(
+        self, question: MetaculusQuestion
+    ) -> list[EvidenceItem]:
+        company_matches = await self._sec_company_matches(question)
+        if not company_matches:
+            return []
+        extra = ",".join(match["cik_str"] for match in company_matches)
+        return await self._cached_evidence_fetch(
+            "sec-edgar",
+            question,
+            lambda: self._fetch_sec_edgar(question, company_matches),
+            extra,
+        )
+
+    async def _sec_company_matches(
+        self, question: MetaculusQuestion
+    ) -> list[dict[str, Any]]:
+        try:
+            ticker_payload = await self._http_get_json(
+                "https://www.sec.gov/files/company_tickers.json",
+                headers={"User-Agent": self._sec_user_agent()},
+                timeout=20,
+            )
+        except Exception as error:
+            logger.warning("SEC ticker map fetch failed: %r", error)
+            return []
+        question_blob = self._question_text_blob(question)
+        ticker_tokens = set(re.findall(r"\b[A-Z]{1,5}\b", getattr(question, "question_text", "")))
+        company_entries = (
+            ticker_payload.values()
+            if isinstance(ticker_payload, dict)
+            else ticker_payload
+        )
+        matches: list[dict[str, Any]] = []
+        for entry in company_entries:
+            ticker = str(entry.get("ticker", "")).upper()
+            title = str(entry.get("title", ""))
+            title_lc = title.lower()
+            if ticker in ticker_tokens or (
+                len(title_lc) >= 5 and title_lc in question_blob
+            ):
+                cik_str = str(entry.get("cik_str", "")).zfill(10)
+                matches.append(
+                    {
+                        "ticker": ticker,
+                        "title": title,
+                        "cik_str": cik_str,
+                    }
+                )
+            if len(matches) >= 3:
+                break
+        return matches
+
+    @staticmethod
+    def _sec_user_agent() -> str:
+        return os.getenv(
+            "SEC_USER_AGENT",
+            "metac-bot-template research bot; set SEC_USER_AGENT with contact email",
+        )
+
+    async def _fetch_sec_edgar(
+        self,
+        question: MetaculusQuestion,
+        company_matches: list[dict[str, Any]],
+    ) -> list[EvidenceItem]:
+        evidence_items: list[EvidenceItem] = []
+        for company in company_matches:
+            cik = company["cik_str"]
+            headers = {"User-Agent": self._sec_user_agent()}
+            try:
+                submissions = await self._http_get_json(
+                    f"https://data.sec.gov/submissions/CIK{cik}.json",
+                    headers=headers,
+                    timeout=20,
+                )
+            except Exception as error:
+                logger.warning("SEC submissions fetch failed for %s: %r", cik, error)
+                continue
+            recent = submissions.get("filings", {}).get("recent", {}) if isinstance(submissions, dict) else {}
+            forms = recent.get("form", [])[:10]
+            filing_dates = recent.get("filingDate", [])[:10]
+            accession_numbers = recent.get("accessionNumber", [])[:10]
+            recent_filings = [
+                f"{form} filed {filing_date}"
+                for form, filing_date in zip(forms, filing_dates)
+                if form and filing_date
+            ][:5]
+            url = f"https://www.sec.gov/edgar/browse/?CIK={int(cik)}"
+            evidence_items.append(
+                EvidenceItem(
+                    source="SEC EDGAR submissions",
+                    provider="sec-edgar",
+                    title=f"{company['title']} ({company['ticker']}) recent filings",
+                    url=url,
+                    retrieved_at=datetime.now(timezone.utc).isoformat(),
+                    summary="; ".join(recent_filings)
+                    or "SEC company found, but no recent filing summary was parsed.",
+                    date=filing_dates[0] if filing_dates else "",
+                    directness="similar",
+                    caveats="Filing existence is not itself a forecast; inspect filings for resolution-specific facts.",
+                    raw={
+                        "company": company,
+                        "recent_forms": forms[:5],
+                        "recent_filing_dates": filing_dates[:5],
+                        "accession_numbers": accession_numbers[:5],
+                    },
+                )
+            )
+            evidence_items.extend(await self._fetch_sec_companyfacts(company))
+        return evidence_items[: self._direct_evidence_max_items_per_provider]
+
+    async def _fetch_sec_companyfacts(
+        self, company: dict[str, Any]
+    ) -> list[EvidenceItem]:
+        cik = company["cik_str"]
+        headers = {"User-Agent": self._sec_user_agent()}
+        try:
+            companyfacts = await self._http_get_json(
+                f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json",
+                headers=headers,
+                timeout=20,
+            )
+        except Exception as error:
+            logger.warning("SEC companyfacts fetch failed for %s: %r", cik, error)
+            return []
+        us_gaap = companyfacts.get("facts", {}).get("us-gaap", {}) if isinstance(companyfacts, dict) else {}
+        fact_names = [
+            "Revenues",
+            "RevenueFromContractWithCustomerExcludingAssessedTax",
+            "NetIncomeLoss",
+            "Assets",
+            "OperatingIncomeLoss",
+        ]
+        evidence_items: list[EvidenceItem] = []
+        for fact_name in fact_names:
+            fact = us_gaap.get(fact_name)
+            if not isinstance(fact, dict):
+                continue
+            units = fact.get("units", {})
+            if not isinstance(units, dict) or not units:
+                continue
+            unit_name, values = next(iter(units.items()))
+            if not isinstance(values, list):
+                continue
+            numeric_values = [
+                value
+                for value in values
+                if value.get("val") is not None and value.get("end")
+            ]
+            if not numeric_values:
+                continue
+            latest = max(numeric_values, key=lambda value: value.get("filed", ""))
+            evidence_items.append(
+                EvidenceItem(
+                    source="SEC EDGAR companyfacts",
+                    provider="sec-companyfacts",
+                    title=f"{company['title']} {fact_name}",
+                    url=f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json",
+                    retrieved_at=datetime.now(timezone.utc).isoformat(),
+                    summary=f"Latest parsed SEC company fact for {fact_name}.",
+                    value=str(latest.get("val", "")),
+                    unit=unit_name,
+                    date=str(latest.get("end", "")),
+                    directness="similar",
+                    caveats="Company facts may be quarterly/annual and may not map to the question's exact metric.",
+                    raw={"company": company, "fact": fact_name, "latest": latest},
+                )
+            )
+            if len(evidence_items) >= 2:
+                break
+        return evidence_items
+
+    async def _fetch_cached_fivethirtyeight_polls(
+        self, question: MetaculusQuestion
+    ) -> list[EvidenceItem]:
+        return await self._cached_evidence_fetch(
+            "fivethirtyeight-polls",
+            question,
+            lambda: self._fetch_fivethirtyeight_polls(question),
+        )
+
+    async def _fetch_fivethirtyeight_polls(
+        self, question: MetaculusQuestion
+    ) -> list[EvidenceItem]:
+        table_names = [
+            "president_polls",
+            "senate_polls",
+            "house_polls",
+            "generic_ballot_polls",
+        ]
+        evidence_items: list[EvidenceItem] = []
+        for table_name in table_names:
+            try:
+                payload = await self._http_get_json(
+                    f"https://projects.fivethirtyeight.com/polls-page/{table_name}.json",
+                    timeout=20,
+                )
+            except Exception:
+                try:
+                    payload = await self._http_get_json(
+                        f"https://fivethirtyeight.datasettes.com/polls/{table_name}.json",
+                        params={
+                            "_shape": "array",
+                            "_size": 10,
+                            "_sort_desc": "end_date",
+                        },
+                        timeout=20,
+                    )
+                except Exception as error:
+                    logger.info("FiveThirtyEight fetch failed for %s: %r", table_name, error)
+                    continue
+            rows = payload if isinstance(payload, list) else payload.get("rows", [])
+            for row in rows[:10]:
+                if not isinstance(row, dict):
+                    continue
+                row_text = json.dumps(row, sort_keys=True)
+                score = self._relevance_score(row_text, question)
+                if score < 0.05:
+                    continue
+                pollster = row.get("pollster") or row.get("pollster_name") or "poll"
+                date = row.get("end_date") or row.get("endDate") or row.get("created_at") or ""
+                evidence_items.append(
+                    EvidenceItem(
+                        source="FiveThirtyEight polling data",
+                        provider="fivethirtyeight",
+                        title=f"{table_name}: {pollster}",
+                        url="https://data.fivethirtyeight.com/",
+                        retrieved_at=datetime.now(timezone.utc).isoformat(),
+                        summary=self._truncate_for_prompt(row_text, 500),
+                        date=str(date),
+                        directness=self._directness_from_score(score),
+                        caveats="Polling rows may require aggregation and likely do not directly map to final election outcome.",
+                        raw=row,
+                    )
+                )
+                if len(evidence_items) >= self._direct_evidence_max_items_per_provider:
+                    return evidence_items
+        return evidence_items
+
+    async def _fetch_cached_acled_events(
+        self, question: MetaculusQuestion
+    ) -> list[EvidenceItem]:
+        return await self._cached_evidence_fetch(
+            "acled",
+            question,
+            lambda: self._fetch_acled_events(question),
+        )
+
+    async def _fetch_acled_events(
+        self, question: MetaculusQuestion
+    ) -> list[EvidenceItem]:
+        api_url = os.getenv("ACLED_API_URL", "https://api.acleddata.com/acled/read")
+        api_key = os.getenv("ACLED_API_KEY")
+        email = os.getenv("ACLED_EMAIL")
+        if not api_key or not email:
+            return []
+        params: dict[str, Any] = {
+            "key": api_key,
+            "email": email,
+            "limit": 20,
+        }
+        countries = self._candidate_country_terms(question)
+        if countries:
+            params["country"] = "|".join(countries[:3])
+        try:
+            payload = await self._http_get_json(api_url, params=params, timeout=25)
+        except Exception as error:
+            logger.warning("ACLED fetch failed: %r", error)
+            return []
+        rows = payload.get("data", []) if isinstance(payload, dict) else []
+        evidence_items: list[EvidenceItem] = []
+        for row in rows[: self._direct_evidence_max_items_per_provider]:
+            row_text = json.dumps(row, sort_keys=True)
+            evidence_items.append(
+                EvidenceItem(
+                    source="ACLED",
+                    provider="acled",
+                    title=f"{row.get('event_type', 'event')} in {row.get('country', '')}",
+                    url="https://acleddata.com/",
+                    retrieved_at=datetime.now(timezone.utc).isoformat(),
+                    summary=self._truncate_for_prompt(row_text, 500),
+                    date=str(row.get("event_date", "")),
+                    directness="similar",
+                    caveats="ACLED event counts need careful filtering by country/date/event type before use as a forecast input.",
+                    raw=row,
+                )
+            )
+        return evidence_items
+
+    @staticmethod
+    def _candidate_country_terms(question: MetaculusQuestion) -> list[str]:
+        country_names = [
+            "Ukraine",
+            "Russia",
+            "China",
+            "Taiwan",
+            "Israel",
+            "Iran",
+            "Gaza",
+            "Lebanon",
+            "Syria",
+            "Yemen",
+            "Sudan",
+            "United States",
+            "United Kingdom",
+            "France",
+            "Germany",
+            "India",
+            "Pakistan",
+            "North Korea",
+            "South Korea",
+        ]
+        question_text = " ".join(
+            [
+                getattr(question, "question_text", ""),
+                getattr(question, "background_info", ""),
+                getattr(question, "resolution_criteria", ""),
+            ]
+        )
+        return [
+            country
+            for country in country_names
+            if country.lower() in question_text.lower()
+        ]
+
+    async def _fetch_ai_benchmark_registry(
+        self, question: MetaculusQuestion
+    ) -> list[EvidenceItem]:
+        evidence_items: list[EvidenceItem] = []
+        question_blob = self._question_text_blob(question)
+        for source_name, url, description in self._ai_benchmark_registry:
+            score = self._relevance_score(f"{source_name} {description}", question)
+            if score < 0.04 and not any(
+                keyword in question_blob
+                for keyword in ("ai", "model", "benchmark", "llm", "agi")
+            ):
+                continue
+            evidence_items.append(
+                EvidenceItem(
+                    source=source_name,
+                    provider="ai-benchmark-registry",
+                    title=source_name,
+                    url=url,
+                    retrieved_at=datetime.now(timezone.utc).isoformat(),
+                    summary=description,
+                    directness="weak" if score < 0.10 else "similar",
+                    caveats="Registry pointer only; use official-data search or deep research to extract the current leaderboard value.",
+                )
+            )
+        return evidence_items[: self._direct_evidence_max_items_per_provider]
+
+    async def _run_market_prior_research(
+        self, question: MetaculusQuestion
+    ) -> str:
+        if not os.getenv("OPENROUTER_API_KEY"):
+            return ""
+        prompt = clean_indents(
+            f"""
+            Search specifically for prediction-market priors relevant to this forecasting question.
+
+            Search targets:
+            - Kalshi
+            - Polymarket
+            - Manifold Markets
+            - Metaculus/community forecasts only as a secondary reference if directly relevant
+
+            Return a compact table with columns:
+            Platform | Market title | URL/source | Directness | Raw market price | Implied probability | Notes
+
+            Requirements:
+            - Separate direct markets from merely analogous markets.
+            - Convert prices/shares to an implied probability when possible.
+            - For multiple-choice, numeric, or date questions, explain what event the market is actually pricing and how it maps to the Metaculus resolution criteria.
+            - Include volume/liquidity or last-updated information when available.
+            - If you find no close market, say "No close market prior found" and list the best analogous searches tried.
+            - Do not make a final forecast.
+
+            Question:
+            {question.question_text}
+
+            Background:
+            {question.background_info}
+
+            Resolution criteria:
+            {question.resolution_criteria}
+
+            Fine print:
+            {question.fine_print}
+            """
+        )
+        searcher = SmartSearcher(
+            model=os.getenv(
+                "MARKET_PRIOR_SEARCH_MODEL",
+                "openrouter/mistralai/mistral-large-2512",
+            ),
+            temperature=0,
+            num_searches_to_run=2,
+            num_sites_per_search=8,
+            use_advanced_filters=False,
+        )
+        research = await searcher.invoke(prompt)
+        logger.info(
+            "Market-prior research for URL %s:\n%s", question.page_url, research
+        )
+        return research
+
+    async def _run_official_data_research(
+        self, question: MetaculusQuestion, topics: list[str]
+    ) -> str:
+        if not os.getenv("OPENROUTER_API_KEY"):
+            return ""
+        topic_hints = "\n".join(
+            f"- {topic}: {self._official_data_source_hints[topic]}"
+            for topic in topics
+            if topic in self._official_data_source_hints
+        )
+        prompt = clean_indents(
+            f"""
+            Run a lightweight official-data research pass for this forecasting question.
+
+            Detected topic categories:
+            {", ".join(topics)}
+
+            Preferred source hints:
+            {topic_hints}
+
+            Output exactly these sections:
+            ## Official/source-of-truth data
+            - Latest relevant official values, statuses, documents, dates, or benchmark results.
+            - Source name and URL for each key fact.
+
+            ## Data caveats
+            - Lag, revision risk, unit mismatches, definitional mismatch, or whether a source is unofficial.
+
+            ## Forecast relevance
+            - Briefly state how each fact changes the evidence base. Do not make a final forecast.
+
+            Question:
+            {question.question_text}
+
+            Background:
+            {question.background_info}
+
+            Resolution criteria:
+            {question.resolution_criteria}
+
+            Fine print:
+            {question.fine_print}
+            """
+        )
+        searcher = SmartSearcher(
+            model=os.getenv(
+                "OFFICIAL_DATA_SEARCH_MODEL",
+                "openrouter/mistralai/mistral-large-2512",
+            ),
+            temperature=0,
+            num_searches_to_run=2,
+            num_sites_per_search=8,
+            use_advanced_filters=False,
+        )
+        research = await searcher.invoke(prompt)
+        logger.info(
+            "Official data research for URL %s:\n%s", question.page_url, research
+        )
+        return research
+
+    async def _run_optional_deep_research(
+        self,
+        question: MetaculusQuestion,
+        focus: str,
+        reason: str,
+    ) -> str:
+        llm = self._deep_research_llm()
+        if llm is None:
+            logger.info(
+                "Skipping optional deep research for URL %s because no deep research provider is configured.",
+                question.page_url,
+            )
+            return ""
+        prompt = clean_indents(
+            f"""
+            You are doing a deeper research pass for a forecasting question.
+            Reason this pass is being run: {reason}
+
+            Focus:
+            {focus}
+
+            Produce a compact, citation-heavy memo with:
+            ## Deep research findings
+            - The most resolution-relevant facts from high-quality sources.
+
+            ## Base rates / analogues
+            - Historical cases or outside-view data where available.
+
+            ## Market / expert priors
+            - Prediction markets, polls, expert forecasts, or consensus estimates where available.
+
+            ## Unresolved cruxes
+            - Facts still uncertain after research.
+
+            Do not produce a final forecast.
+
+            Question:
+            {question.question_text}
+
+            Background:
+            {question.background_info}
+
+            Resolution criteria:
+            {question.resolution_criteria}
+
+            Fine print:
+            {question.fine_print}
+            """
+        )
+        research = await llm.invoke(prompt)
+        logger.info(
+            "Optional deep research via %s for URL %s:\n%s",
+            llm.model,
+            question.page_url,
+            research,
+        )
+        return research
+
+    async def _run_disagreement_targeted_research(
+        self,
+        question: MetaculusQuestion,
+        predictions: list[ReasonedPrediction[T]],
+    ) -> str:
+        cruxes = ""
+        if os.getenv("OPENROUTER_API_KEY"):
+            try:
+                cruxes = await self._extract_disagreement_cruxes(question, predictions)
+            except Exception as error:
+                logger.warning(
+                    "Disagreement crux extraction failed for URL %s: %r",
+                    question.page_url,
+                    error,
+                )
+        research_tasks: list[tuple[str, asyncio.Task[str]]] = []
+        if cruxes.strip() and os.getenv("OPENROUTER_API_KEY"):
+            research_tasks.append(
+                (
+                    "Targeted crux search",
+                    asyncio.create_task(
+                        self._run_targeted_crux_search(question, cruxes)
+                    ),
+                )
+            )
+        if self._env_flag("ENABLE_DEEP_RESEARCH_ON_DISAGREEMENT", True):
+            research_tasks.append(
+                (
+                    "Optional deep research",
+                    asyncio.create_task(
+                        self._run_optional_deep_research(
+                            question,
+                            focus=cruxes
+                            or "The cheap forecaster ensemble disagreed, but no clean crux extraction was available.",
+                            reason="ensemble-disagreement",
+                        )
+                    ),
+                )
+            )
+
+        if not research_tasks:
+            return ""
+
+        results = await asyncio.gather(
+            *(task for _, task in research_tasks), return_exceptions=True
+        )
+        research_sections: list[str] = []
+        for (section_name, _), result in zip(research_tasks, results):
+            if isinstance(result, BaseException):
+                logger.warning(
+                    "%s failed for URL %s: %r",
+                    section_name,
+                    question.page_url,
+                    result,
+                )
+            elif result.strip():
+                research_sections.append(f"## {section_name}\n{result}")
+
+        return "\n\n".join(research_sections)
+
+    async def _extract_disagreement_cruxes(
+        self,
+        question: MetaculusQuestion,
+        predictions: list[ReasonedPrediction[T]],
+    ) -> str:
+        model_outputs = "\n\n".join(
+            self._truncate_for_prompt(
+                f"## Cheap role output {i + 1}\nPrediction: {prediction.prediction_value}\n\nReasoning:\n{prediction.reasoning}",
+                3500,
+            )
+            for i, prediction in enumerate(predictions)
+        )
+        prompt = clean_indents(
+            f"""
+            The cheap role-specific forecasting ensemble disagreed on this Metaculus question.
+            Identify the factual or interpretive cruxes that most explain the disagreement.
+
+            Return 2-4 short bullets. Focus on facts that can be checked with targeted web research:
+            current values, official data, market priors, resolution interpretation, base rates, or specific assumptions.
+            Do not make a forecast.
+
+            Question:
+            {question.question_text}
+
+            Resolution criteria:
+            {question.resolution_criteria}
+
+            Model outputs:
+            {model_outputs}
+            """
+        )
+        analyzer = self.get_llm("summarizer", "llm")
+        cruxes = await analyzer.invoke(prompt)
+        logger.info(
+            "Disagreement cruxes for URL %s:\n%s", question.page_url, cruxes
+        )
+        return self._truncate_for_prompt(cruxes, 2500)
+
+    async def _run_targeted_crux_search(
+        self, question: MetaculusQuestion, cruxes: str
+    ) -> str:
+        prompt = clean_indents(
+            f"""
+            Search the web to resolve the specific cruxes below for a forecasting question.
+            Prioritize official data, primary sources, prediction markets, expert forecasts, and source-of-truth details.
+            Be concise. Include URLs or source names. Do not produce a final probability or distribution.
+
+            Output:
+            ## Targeted crux research
+            - For each crux, state the best evidence found and whether it supports a higher/lower forecast, earlier/later date, or a particular option.
+            - Flag unresolved uncertainty or source conflict.
+
+            Question:
+            {question.question_text}
+
+            Resolution criteria:
+            {question.resolution_criteria}
+
+            Cruxes:
+            {cruxes}
+            """
+        )
+        searcher = SmartSearcher(
+            model="openrouter/mistralai/mistral-large-2512",
+            temperature=0,
+            num_searches_to_run=2,
+            num_sites_per_search=8,
+            use_advanced_filters=False,
+        )
+        research = await searcher.invoke(prompt)
+        logger.info(
+            "Targeted crux research for URL %s:\n%s", question.page_url, research
+        )
+        return research
 
     ##################################### BINARY QUESTIONS #####################################
 
@@ -202,6 +2710,8 @@ class SpringTemplateBot2026(ForecastBot):
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
+            {self._forecasting_checklist()}
+
             Before answering you write:
             (a) The time left until the outcome to the question is known.
             (b) The status quo outcome if nothing changed.
@@ -222,20 +2732,84 @@ class SpringTemplateBot2026(ForecastBot):
         question: BinaryQuestion,
         prompt: str,
     ) -> ReasonedPrediction[float]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
+        tasks = [
+            asyncio.create_task(
+                self._binary_prediction_from_llm(
+                    spec.llm, question, self._role_prompt(prompt, spec), spec
+                )
+            )
+            for spec in self._base_forecaster_specs()
+        ]
+        predictions = await self._gather_ensemble_predictions(tasks, question)
+        if self._should_escalate_binary(predictions):
+            logger.info(
+                "Binary ensemble disagreement triggered GPT-5.5 escalation for URL %s.",
+                question.page_url,
+            )
+            escalation_spec = self._escalation_forecaster_spec()
+            predictions.append(
+                await self._binary_prediction_from_llm(
+                    escalation_spec.llm,
+                    question,
+                    self._role_prompt(
+                        await self._build_targeted_escalation_prompt(
+                            question, prompt, predictions
+                        ),
+                        escalation_spec,
+                    ),
+                    escalation_spec,
+                )
+            )
+        predictions_for_aggregation = self._collapse_same_model_binary_predictions(
+            predictions
+        )
+        model_probabilities = [
+            prediction.prediction_value for prediction in predictions_for_aggregation
+        ]
+        decimal_pred = self._logit_mean_probability(model_probabilities)
+
+        logger.info(
+            f"Forecasted URL {question.page_url} with ensemble prediction: {decimal_pred}. "
+            f"Member probabilities: {model_probabilities}"
+        )
+        return ReasonedPrediction(
+            prediction_value=decimal_pred,
+            reasoning=self._combine_model_reasoning(predictions_for_aggregation),
+        )
+
+    async def _binary_prediction_from_llm(
+        self,
+        llm: GeneralLlm,
+        question: BinaryQuestion,
+        prompt: str,
+        role_spec: ForecasterRoleSpec | None = None,
+    ) -> ReasonedPrediction[float]:
+        reasoning = await llm.invoke(prompt)
+        role_name = role_spec.name if role_spec else "Unspecified role"
+        logger.info(
+            "Reasoning from %s (%s) for URL %s: %s",
+            llm.model,
+            role_name,
+            question.page_url,
+            reasoning,
+        )
         binary_prediction: BinaryPrediction = await structure_output(
             reasoning,
             BinaryPrediction,
             model=self.get_llm("parser", "llm"),
             num_validation_samples=self._structure_output_validation_samples,
         )
-        decimal_pred = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
+        decimal_pred = self._clamp_probability(
+            binary_prediction.prediction_in_decimal
+        )
 
         logger.info(
-            f"Forecasted URL {question.page_url} with prediction: {decimal_pred}."
+            f"Forecasted URL {question.page_url} with {llm.model} ({role_name}) prediction: {decimal_pred}."
         )
-        return ReasonedPrediction(prediction_value=decimal_pred, reasoning=reasoning)
+        return ReasonedPrediction(
+            prediction_value=decimal_pred,
+            reasoning=f"Role: {role_name}\nModel: {llm.model}\n\n{reasoning}",
+        )
 
     ##################################### MULTIPLE CHOICE QUESTIONS #####################################
 
@@ -265,6 +2839,8 @@ class SpringTemplateBot2026(ForecastBot):
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
+            {self._forecasting_checklist()}
+
             Before answering you write:
             (a) The time left until the outcome to the question is known.
             (b) The status quo outcome if nothing changed.
@@ -287,6 +2863,62 @@ class SpringTemplateBot2026(ForecastBot):
         question: MultipleChoiceQuestion,
         prompt: str,
     ) -> ReasonedPrediction[PredictedOptionList]:
+        tasks = [
+            asyncio.create_task(
+                self._multiple_choice_prediction_from_llm(
+                    spec.llm, question, self._role_prompt(prompt, spec), spec
+                )
+            )
+            for spec in self._base_forecaster_specs()
+        ]
+        predictions = await self._gather_ensemble_predictions(tasks, question)
+        if self._should_escalate_multiple_choice(predictions):
+            logger.info(
+                "Multiple-choice ensemble disagreement triggered GPT-5.5 escalation for URL %s.",
+                question.page_url,
+            )
+            escalation_spec = self._escalation_forecaster_spec()
+            predictions.append(
+                await self._multiple_choice_prediction_from_llm(
+                    escalation_spec.llm,
+                    question,
+                    self._role_prompt(
+                        await self._build_targeted_escalation_prompt(
+                            question, prompt, predictions
+                        ),
+                        escalation_spec,
+                    ),
+                    escalation_spec,
+                )
+            )
+        predictions_for_aggregation = (
+            await self._collapse_same_model_multiple_choice_predictions(
+                predictions, question
+            )
+        )
+        option_lists = [
+            prediction.prediction_value
+            for prediction in predictions_for_aggregation
+        ]
+        aggregated_prediction = await MultipleChoiceReport.aggregate_predictions(
+            option_lists, question
+        )
+
+        logger.info(
+            f"Forecasted URL {question.page_url} with ensemble prediction: {aggregated_prediction}."
+        )
+        return ReasonedPrediction(
+            prediction_value=aggregated_prediction,
+            reasoning=self._combine_model_reasoning(predictions_for_aggregation),
+        )
+
+    async def _multiple_choice_prediction_from_llm(
+        self,
+        llm: GeneralLlm,
+        question: MultipleChoiceQuestion,
+        prompt: str,
+        role_spec: ForecasterRoleSpec | None = None,
+    ) -> ReasonedPrediction[PredictedOptionList]:
         parsing_instructions = clean_indents(
             f"""
             Make sure that all option names are one of the following:
@@ -296,8 +2928,15 @@ class SpringTemplateBot2026(ForecastBot):
             Additionally, you may sometimes need to parse a 0% probability. Please do not skip options with 0% but rather make it an entry in your final list with 0% probability.
             """
         )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
+        reasoning = await llm.invoke(prompt)
+        role_name = role_spec.name if role_spec else "Unspecified role"
+        logger.info(
+            "Reasoning from %s (%s) for URL %s: %s",
+            llm.model,
+            role_name,
+            question.page_url,
+            reasoning,
+        )
         predicted_option_list: PredictedOptionList = await structure_output(
             text_to_structure=reasoning,
             output_type=PredictedOptionList,
@@ -307,10 +2946,11 @@ class SpringTemplateBot2026(ForecastBot):
         )
 
         logger.info(
-            f"Forecasted URL {question.page_url} with prediction: {predicted_option_list}."
+            f"Forecasted URL {question.page_url} with {llm.model} ({role_name}) prediction: {predicted_option_list}."
         )
         return ReasonedPrediction(
-            prediction_value=predicted_option_list, reasoning=reasoning
+            prediction_value=predicted_option_list,
+            reasoning=f"Role: {role_name}\nModel: {llm.model}\n\n{reasoning}",
         )
 
     ##################################### NUMERIC QUESTIONS #####################################
@@ -342,13 +2982,15 @@ class SpringTemplateBot2026(ForecastBot):
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
+            {self._forecasting_checklist()}
+
             {lower_bound_message}
             {upper_bound_message}
 
             Formatting Instructions:
             - Please notice the units requested and give your answer in these units (e.g. whether you represent a number as 1,000,000 or 1 million).
             - Never use scientific notation.
-            - Always start with a smaller number (more negative if negative) and then increase from there. The value for percentile 10 should always be less than the value for percentile 20, and so on.
+            - Always start with a smaller number (more negative if negative) and then increase from there. The value for percentile 2.5 should always be less than the value for percentile 5, and so on.
 
             Before answering you write:
             (a) The time left until the outcome to the question is known.
@@ -363,12 +3005,17 @@ class SpringTemplateBot2026(ForecastBot):
 
             The last thing you write is your final answer as:
             "
-            Percentile 10: XX (lowest number value)
+            Percentile 2.5: XX (lowest number value)
+            Percentile 5: XX
+            Percentile 10: XX
             Percentile 20: XX
             Percentile 40: XX
+            Percentile 50: XX
             Percentile 60: XX
             Percentile 80: XX
-            Percentile 90: XX (highest number value)
+            Percentile 90: XX
+            Percentile 95: XX
+            Percentile 97.5: XX (highest number value)
             "
             """
         )
@@ -379,8 +3026,70 @@ class SpringTemplateBot2026(ForecastBot):
         question: NumericQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
+        tasks = [
+            asyncio.create_task(
+                self._numeric_prediction_from_llm(
+                    spec.llm, question, self._role_prompt(prompt, spec), spec
+                )
+            )
+            for spec in self._base_forecaster_specs()
+        ]
+        predictions = await self._gather_ensemble_predictions(tasks, question)
+        if self._should_escalate_numeric(predictions, question):
+            logger.info(
+                "Numeric ensemble disagreement triggered GPT-5.5 escalation for URL %s.",
+                question.page_url,
+            )
+            escalation_spec = self._escalation_forecaster_spec()
+            predictions.append(
+                await self._numeric_prediction_from_llm(
+                    escalation_spec.llm,
+                    question,
+                    self._role_prompt(
+                        await self._build_targeted_escalation_prompt(
+                            question, prompt, predictions
+                        ),
+                        escalation_spec,
+                    ),
+                    escalation_spec,
+                )
+            )
+        predictions_for_aggregation = await self._collapse_same_model_numeric_predictions(
+            predictions, question
+        )
+        distributions = [
+            prediction.prediction_value
+            for prediction in predictions_for_aggregation
+        ]
+        aggregated_prediction = await NumericReport.aggregate_predictions(
+            distributions, question
+        )
+
+        logger.info(
+            f"Forecasted URL {question.page_url} with ensemble prediction: "
+            f"{aggregated_prediction.declared_percentiles}."
+        )
+        return ReasonedPrediction(
+            prediction_value=aggregated_prediction,
+            reasoning=self._combine_model_reasoning(predictions_for_aggregation),
+        )
+
+    async def _numeric_prediction_from_llm(
+        self,
+        llm: GeneralLlm,
+        question: NumericQuestion,
+        prompt: str,
+        role_spec: ForecasterRoleSpec | None = None,
+    ) -> ReasonedPrediction[NumericDistribution]:
+        reasoning = await llm.invoke(prompt)
+        role_name = role_spec.name if role_spec else "Unspecified role"
+        logger.info(
+            "Reasoning from %s (%s) for URL %s: %s",
+            llm.model,
+            role_name,
+            question.page_url,
+            reasoning,
+        )
         parsing_instructions = clean_indents(
             f"""
             The text given to you is trying to give a forecast distribution for a numeric question.
@@ -403,9 +3112,12 @@ class SpringTemplateBot2026(ForecastBot):
         )
         prediction = NumericDistribution.from_question(percentile_list, question)
         logger.info(
-            f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
+            f"Forecasted URL {question.page_url} with {llm.model} ({role_name}) prediction: {prediction.declared_percentiles}."
         )
-        return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+        return ReasonedPrediction(
+            prediction_value=prediction,
+            reasoning=f"Role: {role_name}\nModel: {llm.model}\n\n{reasoning}",
+        )
 
     ##################################### DATE QUESTIONS #####################################
 
@@ -434,6 +3146,8 @@ class SpringTemplateBot2026(ForecastBot):
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
+            {self._forecasting_checklist()}
+
             {lower_bound_message}
             {upper_bound_message}
 
@@ -441,7 +3155,7 @@ class SpringTemplateBot2026(ForecastBot):
             - This is a date question, and as such, the answer must be expressed in terms of dates.
             - The dates must be written in the format of YYYY-MM-DD. If hours matter, please append the date with the hour in UTC and military time: YYYY-MM-DDTHH:MM:SSZ.No other formatting is allowed.
             - Always start with a lower date chronologically and then increase from there.
-            - Do NOT forget this. The dates must be written in chronological order starting at the earliest time at percentile 10 and increasing from there.
+            - Do NOT forget this. The dates must be written in chronological order starting at the earliest time at percentile 2.5 and increasing from there.
 
             Before answering you write:
             (a) The time left until the outcome to the question is known.
@@ -456,12 +3170,17 @@ class SpringTemplateBot2026(ForecastBot):
 
             The last thing you write is your final answer as:
             "
-            Percentile 10: YYYY-MM-DD (oldest date)
+            Percentile 2.5: YYYY-MM-DD (oldest date)
+            Percentile 5: YYYY-MM-DD
+            Percentile 10: YYYY-MM-DD
             Percentile 20: YYYY-MM-DD
             Percentile 40: YYYY-MM-DD
+            Percentile 50: YYYY-MM-DD
             Percentile 60: YYYY-MM-DD
             Percentile 80: YYYY-MM-DD
-            Percentile 90: YYYY-MM-DD (newest date)
+            Percentile 90: YYYY-MM-DD
+            Percentile 95: YYYY-MM-DD
+            Percentile 97.5: YYYY-MM-DD (newest date)
             "
             """
         )
@@ -473,8 +3192,70 @@ class SpringTemplateBot2026(ForecastBot):
         question: DateQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
+        tasks = [
+            asyncio.create_task(
+                self._date_prediction_from_llm(
+                    spec.llm, question, self._role_prompt(prompt, spec), spec
+                )
+            )
+            for spec in self._base_forecaster_specs()
+        ]
+        predictions = await self._gather_ensemble_predictions(tasks, question)
+        if self._should_escalate_numeric(predictions, question):
+            logger.info(
+                "Date ensemble disagreement triggered GPT-5.5 escalation for URL %s.",
+                question.page_url,
+            )
+            escalation_spec = self._escalation_forecaster_spec()
+            predictions.append(
+                await self._date_prediction_from_llm(
+                    escalation_spec.llm,
+                    question,
+                    self._role_prompt(
+                        await self._build_targeted_escalation_prompt(
+                            question, prompt, predictions
+                        ),
+                        escalation_spec,
+                    ),
+                    escalation_spec,
+                )
+            )
+        predictions_for_aggregation = await self._collapse_same_model_numeric_predictions(
+            predictions, question
+        )
+        distributions = [
+            prediction.prediction_value
+            for prediction in predictions_for_aggregation
+        ]
+        aggregated_prediction = await NumericReport.aggregate_predictions(
+            distributions, question
+        )
+
+        logger.info(
+            f"Forecasted URL {question.page_url} with ensemble prediction: "
+            f"{aggregated_prediction.declared_percentiles}."
+        )
+        return ReasonedPrediction(
+            prediction_value=aggregated_prediction,
+            reasoning=self._combine_model_reasoning(predictions_for_aggregation),
+        )
+
+    async def _date_prediction_from_llm(
+        self,
+        llm: GeneralLlm,
+        question: DateQuestion,
+        prompt: str,
+        role_spec: ForecasterRoleSpec | None = None,
+    ) -> ReasonedPrediction[NumericDistribution]:
+        reasoning = await llm.invoke(prompt)
+        role_name = role_spec.name if role_spec else "Unspecified role"
+        logger.info(
+            "Reasoning from %s (%s) for URL %s: %s",
+            llm.model,
+            role_name,
+            question.page_url,
+            reasoning,
+        )
         parsing_instructions = clean_indents(
             f"""
             The text given to you is trying to give a forecast distribution for a date question.
@@ -501,9 +3282,12 @@ class SpringTemplateBot2026(ForecastBot):
         ]
         prediction = NumericDistribution.from_question(percentile_list, question)
         logger.info(
-            f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
+            f"Forecasted URL {question.page_url} with {llm.model} ({role_name}) prediction: {prediction.declared_percentiles}."
         )
-        return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+        return ReasonedPrediction(
+            prediction_value=prediction,
+            reasoning=f"Role: {role_name}\nModel: {llm.model}\n\n{reasoning}",
+        )
 
     def _create_upper_and_lower_bound_messages(
         self, question: NumericQuestion | DateQuestion
@@ -651,6 +3435,11 @@ if __name__ == "__main__":
     litellm_logger.setLevel(logging.WARNING)
     litellm_logger.propagate = False
 
+    default_experiment_mode = os.getenv(
+        "EXPERIMENT_MODE",
+        "random" if _env_bool("ENABLE_EXPERIMENT_VARIANTS", False) else "off",
+    )
+
     parser = argparse.ArgumentParser(
         description="Run the TemplateBot forecasting system"
     )
@@ -660,75 +3449,159 @@ if __name__ == "__main__":
         choices=[
             "tournament",
             "repredict_tournament",
+            "minibench",
+            "benchmarking_questions",
             "metaculus_cup",
             "test_questions",
         ],
         default="tournament",
         help="Specify the run mode (default: tournament)",
     )
+    parser.add_argument(
+        "--tournament-id",
+        action="append",
+        default=None,
+        help="Tournament slug/id to forecast. Can be passed multiple times. Defaults to summer-futureeval-2026 for tournament modes.",
+    )
+    parser.add_argument(
+        "--practice",
+        action="store_true",
+        help="Run forecasts without publishing to Metaculus. Useful for quick experiments.",
+    )
+    parser.add_argument(
+        "--experiment-mode",
+        choices=["off", "random", "variant"],
+        default=default_experiment_mode,
+        help="Choose whether to run a random or fixed experiment variant. Default comes from EXPERIMENT_MODE/ENABLE_EXPERIMENT_VARIANTS.",
+    )
+    parser.add_argument(
+        "--experiment-variant",
+        type=int,
+        default=(
+            int(os.getenv("EXPERIMENT_VARIANT"))
+            if os.getenv("EXPERIMENT_VARIANT", "").strip().isdigit()
+            else None
+        ),
+        help="Fixed experiment variant id. If provided with experiment-mode=off, variant mode is used.",
+    )
+    parser.add_argument(
+        "--experiment-seed",
+        type=int,
+        default=(
+            int(os.getenv("EXPERIMENT_SEED"))
+            if os.getenv("EXPERIMENT_SEED", "").strip().isdigit()
+            else None
+        ),
+        help="Seed for random experiment-variant selection.",
+    )
+    parser.add_argument(
+        "--experiment-log-dir",
+        type=str,
+        default=os.getenv("EXPERIMENT_LOG_DIR", "experiment_logs"),
+        help="Directory for experiment manifests and JSONL forecast logs.",
+    )
+    parser.add_argument(
+        "--allow-publish-experiments",
+        action="store_true",
+        default=_env_bool("ALLOW_PUBLISH_EXPERIMENTS", False),
+        help="Allow random/fixed experiment variants to publish forecasts. Default is false for safety.",
+    )
     args = parser.parse_args()
     run_mode: Literal[
         "tournament",
         "repredict_tournament",
+        "minibench",
+        "benchmarking_questions",
         "metaculus_cup",
         "test_questions",
     ] = args.mode
     assert run_mode in [
         "tournament",
         "repredict_tournament",
+        "minibench",
+        "benchmarking_questions",
         "metaculus_cup",
         "test_questions",
     ], "Invalid run mode"
 
+    selected_variant, experiment_seed = _select_experiment_variant(
+        args.experiment_mode, args.experiment_variant, args.experiment_seed
+    )
+    _apply_experiment_variant(selected_variant)
+    SpringTemplateBot2026.apply_runtime_config_from_env()
+    variant_name = selected_variant.name if selected_variant else "no_variant"
+    run_id = (
+        f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+        f"_{run_mode}_{variant_name}"
+    )
+    publish_reports = not args.practice
+    if selected_variant and not args.allow_publish_experiments:
+        logger.info(
+            "Experiment variant selected; disabling Metaculus publishing. "
+            "Pass --allow-publish-experiments to override."
+        )
+        publish_reports = False
+    if run_mode == "benchmarking_questions" and not args.allow_publish_experiments:
+        publish_reports = False
+
     template_bot = SpringTemplateBot2026(
         research_reports_per_question=1,
-        predictions_per_research_report=5,
-        use_research_summary_to_forecast=False,
-        publish_reports_to_metaculus=True,
+        predictions_per_research_report=1,
+        use_research_summary_to_forecast=True,
+        publish_reports_to_metaculus=publish_reports,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
-        # llms={  # choose your model names or GeneralLlm llms here, otherwise defaults will be chosen for you
-        #     "default": GeneralLlm(
-        #         model="openrouter/openai/gpt-4o", # "anthropic/claude-sonnet-4-20250514", etc (see docs for litellm)
-        #         temperature=0.3,
-        #         timeout=40,
-        #         allowed_tries=2,
-        #     ),
-        #     "summarizer": "openai/gpt-4o-mini",
-        #     "researcher": "asknews/news-summaries",
-        #     "parser": "openai/gpt-4o-mini",
-        # },
+        llms={
+            "default": GeneralLlm(
+                model=os.getenv(
+                    "DEFAULT_FORECASTER_MODEL",
+                    "openrouter/mistralai/mistral-large-2512",
+                ),
+                temperature=0.25,
+                timeout=180,
+                allowed_tries=2,
+            ),
+            "summarizer": os.getenv(
+                "SUMMARIZER_MODEL", "openrouter/openai/gpt-5-nano"
+            ),
+            "researcher": "asknews/news-summaries",
+            "parser": os.getenv("PARSER_MODEL", "openrouter/openai/gpt-5-nano"),
+        },
     )
 
     client = MetaculusClient()
-    if run_mode == "tournament":
-        # You may want to change this to the specific tournament ID you want to forecast on
-        seasonal_tournament_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
+    default_tournament_ids_by_mode: dict[str, list[str | int]] = {
+        "tournament": ["summer-futureeval-2026"],
+        "repredict_tournament": ["summer-futureeval-2026"],
+        "minibench": ["minibench"],
+        "benchmarking_questions": ["bot-benchmarking-question-list"],
+    }
+    target_tournament_ids: list[str | int] = args.tournament_id or default_tournament_ids_by_mode.get(
+        run_mode, ["summer-futureeval-2026"]
+    )
+    if run_mode in ["tournament", "minibench", "benchmarking_questions"]:
+        forecast_reports = []
+        for tournament_id in target_tournament_ids:
+            forecast_reports.extend(
+                asyncio.run(
+                    template_bot.forecast_on_tournament(
+                        tournament_id, return_exceptions=True
+                    )
+                )
             )
-        )
-        minibench_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_MINIBENCH_ID, return_exceptions=True
-            )
-        )
-        forecast_reports = seasonal_tournament_reports + minibench_reports
     elif run_mode == "repredict_tournament":
-        # Reforecast all currently open questions in both the seasonal AIB tournament and MiniBench.
+        # Reforecast all currently open questions in the explicitly targeted tournaments.
         template_bot.skip_previously_forecasted_questions = False
-        seasonal_tournament_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
+        forecast_reports = []
+        for tournament_id in target_tournament_ids:
+            forecast_reports.extend(
+                asyncio.run(
+                    template_bot.forecast_on_tournament(
+                        tournament_id, return_exceptions=True
+                    )
+                )
             )
-        )
-        minibench_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_MINIBENCH_ID, return_exceptions=True
-            )
-        )
-        forecast_reports = seasonal_tournament_reports + minibench_reports
     elif run_mode == "metaculus_cup":
         # The Metaculus cup is a good way to test the bot's performance on regularly open questions. You can also use AXC_2025_TOURNAMENT_ID = 32564 or AI_2027_TOURNAMENT_ID = "ai-2027"
         # The Metaculus cup may not be initialized near the beginning of a season (i.e. January, May, September)
@@ -755,3 +3628,13 @@ if __name__ == "__main__":
             template_bot.forecast_questions(questions, return_exceptions=True)
         )
     template_bot.log_report_summary(forecast_reports)
+    _write_experiment_logs(
+        forecast_reports,
+        run_id=run_id,
+        log_dir=Path(args.experiment_log_dir),
+        mode=run_mode,
+        target_tournament_ids=target_tournament_ids,
+        selected_variant=selected_variant,
+        experiment_seed=experiment_seed,
+        publish_reports=publish_reports,
+    )
