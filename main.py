@@ -3547,8 +3547,6 @@ if __name__ == "__main__":
             "Pass --allow-publish-experiments to override."
         )
         publish_reports = False
-    if run_mode == "benchmarking_questions" and not args.allow_publish_experiments:
-        publish_reports = False
 
     template_bot = SpringTemplateBot2026(
         research_reports_per_question=1,
