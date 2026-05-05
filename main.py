@@ -1538,12 +1538,15 @@ class SpringTemplateBot2026(ForecastBot):
                 (
                     "AskNews / configured research",
                     self._run_configured_researcher(researcher, prompt, question),
-                ),
-                (
-                    "Supplemental web/source research",
-                    self._run_supplemental_web_research(question),
-                ),
+                )
             ]
+            if self._env_flag("ENABLE_SUPPLEMENTAL_WEB_RESEARCH", True):
+                research_tasks.append(
+                    (
+                        "Supplemental web/source research",
+                        self._run_supplemental_web_research(question),
+                    )
+                )
             if self._env_flag("ENABLE_DIRECT_STRUCTURED_RESEARCH", True):
                 research_tasks.append(
                     (
@@ -3743,11 +3746,21 @@ if __name__ == "__main__":
                 allowed_tries=2,
                 max_tokens=_env_int("FORECASTER_MAX_TOKENS", 4096),
             ),
-            "summarizer": os.getenv(
-                "SUMMARIZER_MODEL", "openrouter/openai/gpt-5-nano"
+            "summarizer": GeneralLlm(
+                model=os.getenv("SUMMARIZER_MODEL", "openrouter/openai/gpt-5-nano"),
+                temperature=0.1,
+                timeout=120,
+                allowed_tries=2,
+                max_tokens=_env_int("SUMMARIZER_MAX_TOKENS", 2048),
+            ),
+            "parser": GeneralLlm(
+                model=os.getenv("PARSER_MODEL", "openrouter/openai/gpt-5-nano"),
+                temperature=0,
+                timeout=120,
+                allowed_tries=2,
+                max_tokens=_env_int("PARSER_MAX_TOKENS", 1024),
             ),
             "researcher": os.getenv("RESEARCHER_MODEL", "asknews/news-summaries"),
-            "parser": os.getenv("PARSER_MODEL", "openrouter/openai/gpt-5-nano"),
         },
     )
 
