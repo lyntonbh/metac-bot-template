@@ -18,7 +18,7 @@ on:
         default: false
         type: boolean
   schedule:
-    - cron: "17 */3 * * *" # MiniBench practice loop every 3 hours.
+    - cron: "*/20 * * * *" # MiniBench questions can have very short forecast windows.
 
 concurrency:
   group: ${{ github.workflow }}
@@ -74,6 +74,30 @@ jobs:
           ALLOW_PUBLISH_EXPERIMENTS: "false"
           ENABLE_EXPERIMENT_LOGGING: "true"
           EXPERIMENT_LOG_DIR: "experiment_logs"
+      - name: Publish practice forecast status
+        if: always()
+        run: |
+          echo "## Practice forecast status" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if compgen -G "experiment_logs/*/run_summary.md" > /dev/null; then
+            for summary in experiment_logs/*/run_summary.md; do
+              cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+            done
+          else
+            echo "No run summary was produced. Check the preceding workflow logs for a setup or dependency failure." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if grep -R '"status": "forecasted"' experiment_logs >/dev/null 2>&1; then
+            echo "::notice title=Forecasts returned::At least one practice run produced forecast reports."
+          else
+            echo "::notice title=No forecasts returned::The run completed, but no eligible questions were forecasted."
+          fi
+
+          if grep -R '"status": "errors"' experiment_logs >/dev/null 2>&1; then
+            echo "::warning title=Forecast exceptions::At least one practice run returned exceptions."
+          fi
       - name: Upload practice forecast logs
         if: always()
         uses: actions/upload-artifact@v4

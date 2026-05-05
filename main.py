@@ -266,6 +266,95 @@ def _report_log_record(report: Any) -> dict[str, Any]:
     }
 
 
+def _summarize_forecast_reports(
+    forecast_reports: list[Any], *, publish_reports: bool
+) -> dict[str, Any]:
+    ok_reports = [
+        report for report in forecast_reports if not isinstance(report, BaseException)
+    ]
+    exception_reports = [
+        report for report in forecast_reports if isinstance(report, BaseException)
+    ]
+    question_records = [
+        _question_log_record(getattr(report, "question", None))
+        for report in ok_reports
+    ]
+    question_ids = [
+        record.get("id") or record.get("id_of_post")
+        for record in question_records
+        if record.get("id") or record.get("id_of_post")
+    ]
+    if ok_reports:
+        status = "forecasted"
+        message = (
+            f"Forecasted {len(ok_reports)} question(s)"
+            f"{' and attempted to publish them' if publish_reports else ' in practice mode'}."
+        )
+    elif exception_reports:
+        status = "errors"
+        message = f"No successful forecasts; {len(exception_reports)} exception(s) returned."
+    else:
+        status = "no_eligible_questions"
+        message = (
+            "No forecast reports were returned. This usually means the target had no "
+            "eligible open questions, or all open questions were skipped because the bot "
+            "had already forecasted them."
+        )
+    return {
+        "status": status,
+        "message": message,
+        "reports_returned": len(forecast_reports),
+        "successful_forecasts": len(ok_reports),
+        "exceptions": len(exception_reports),
+        "publish_reports_to_metaculus": publish_reports,
+        "question_ids": question_ids,
+        "questions": question_records,
+    }
+
+
+def _run_summary_markdown(
+    *,
+    run_id: str,
+    mode: str,
+    target_tournament_ids: list[str | int],
+    selected_variant: ExperimentVariant | None,
+    experiment_seed: int | None,
+    summary: dict[str, Any],
+) -> str:
+    target_text = ", ".join(str(target_id) for target_id in target_tournament_ids)
+    variant_text = (
+        f"{selected_variant.id} ({selected_variant.name})"
+        if selected_variant
+        else "off"
+    )
+    question_ids = summary.get("question_ids") or []
+    question_text = (
+        ", ".join(str(question_id) for question_id in question_ids)
+        if question_ids
+        else "none"
+    )
+    return clean_indents(
+        f"""
+        # Forecast Run Status
+
+        **Status:** {summary["status"]}
+
+        {summary["message"]}
+
+        - Run ID: `{run_id}`
+        - Mode: `{mode}`
+        - Target: `{target_text}`
+        - Publish to Metaculus: `{summary["publish_reports_to_metaculus"]}`
+        - Reports returned: `{summary["reports_returned"]}`
+        - Successful forecasts: `{summary["successful_forecasts"]}`
+        - Exceptions: `{summary["exceptions"]}`
+        - Question IDs: `{question_text}`
+        - Experiment variant: `{variant_text}`
+        - Experiment seed: `{experiment_seed}`
+        """
+    ).strip() + "\n"
+
+
 def _write_experiment_logs(
     forecast_reports: list[Any],
     *,
@@ -281,6 +370,9 @@ def _write_experiment_logs(
         return
     run_dir = log_dir / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
+    summary = _summarize_forecast_reports(
+        forecast_reports, publish_reports=publish_reports
+    )
     variant_payload = (
         {
             "id": selected_variant.id,
@@ -320,9 +412,24 @@ def _write_experiment_logs(
                 "ENABLE_DEEP_RESEARCH_ON_HIGH_VALUE",
             )
         },
+        "forecast_summary": summary,
     }
     (run_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2), encoding="utf-8"
+    )
+    (run_dir / "run_status.json").write_text(
+        json.dumps(summary, indent=2), encoding="utf-8"
+    )
+    (run_dir / "run_summary.md").write_text(
+        _run_summary_markdown(
+            run_id=run_id,
+            mode=mode,
+            target_tournament_ids=target_tournament_ids,
+            selected_variant=selected_variant,
+            experiment_seed=experiment_seed,
+            summary=summary,
+        ),
+        encoding="utf-8",
     )
     jsonl_path = run_dir / "forecast_reports.jsonl"
     with jsonl_path.open("w", encoding="utf-8") as handle:
@@ -334,6 +441,7 @@ def _write_experiment_logs(
             }
             handle.write(json.dumps(record, ensure_ascii=True) + "\n")
     logger.info("Experiment logs written to %s", run_dir)
+    logger.info("Forecast run status: %s - %s", summary["status"], summary["message"])
 
 
 class SpringTemplateBot2026(ForecastBot):
