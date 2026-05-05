@@ -3578,7 +3578,7 @@ if __name__ == "__main__":
     default_tournament_ids_by_mode: dict[str, list[str | int]] = {
         "tournament": ["summer-futureeval-2026"],
         "repredict_tournament": ["summer-futureeval-2026"],
-        "minibench": ["minibench"],
+        "minibench": [client.CURRENT_MINIBENCH_ID],
         "benchmarking_questions": ["bot-benchmarking-question-list"],
     }
     target_tournament_ids: list[str | int] = args.tournament_id or default_tournament_ids_by_mode.get(
