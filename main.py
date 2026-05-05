@@ -990,6 +990,51 @@ class SpringTemplateBot2026(ForecastBot):
             """
         )
 
+    @classmethod
+    def _parse_numeric_percentiles_from_text(cls, text: str) -> list[Percentile] | None:
+        percentile_values: dict[float, float] = {}
+        percentile_line_pattern = re.compile(
+            r"""
+            (?:
+                percentile\s+
+                (?P<pct_after_label>\d+(?:\.\d+)?)
+                |
+                (?P<pct_before_label>\d+(?:\.\d+)?)(?:st|nd|rd|th)?\s+percentile
+            )
+            \s*(?:[:=\-]|is|at|around|of)?\s*
+            (?P<value>.*)
+            """,
+            flags=re.IGNORECASE | re.VERBOSE,
+        )
+        for line in text.splitlines():
+            match = percentile_line_pattern.search(line)
+            if not match:
+                continue
+            raw_percentile = match.group("pct_after_label") or match.group(
+                "pct_before_label"
+            )
+            raw_value = match.group("value")
+            try:
+                percentile = float(raw_percentile)
+            except (TypeError, ValueError):
+                continue
+            percentile = percentile / 100 if percentile > 1 else percentile
+            value_match = re.search(
+                r"[-+]?\d+(?:,\d{3})*(?:\.\d+)?|[-+]?\.\d+",
+                raw_value.replace(",", ""),
+            )
+            if not value_match:
+                continue
+            value = float(value_match.group(0))
+            percentile_values[percentile] = value
+
+        if len(percentile_values) < 3 or 0.5 not in percentile_values:
+            return None
+        return [
+            Percentile(percentile=percentile, value=value)
+            for percentile, value in sorted(percentile_values.items())
+        ]
+
     @staticmethod
     def _model_key_from_reasoning(
         prediction: ReasonedPrediction[T], fallback: str
@@ -3298,6 +3343,32 @@ class SpringTemplateBot2026(ForecastBot):
             question.page_url,
             reasoning,
         )
+        deterministic_percentiles = self._parse_numeric_percentiles_from_text(
+            reasoning
+        )
+        if deterministic_percentiles:
+            try:
+                prediction = NumericDistribution.from_question(
+                    deterministic_percentiles, question
+                )
+            except Exception as error:
+                logger.warning(
+                    "Deterministic numeric percentile parsing failed for URL %s: %r",
+                    question.page_url,
+                    error,
+                )
+            else:
+                logger.info(
+                    "Parsed numeric percentiles deterministically for URL %s with %s (%s): %s.",
+                    question.page_url,
+                    llm.model,
+                    role_name,
+                    prediction.declared_percentiles,
+                )
+                return ReasonedPrediction(
+                    prediction_value=prediction,
+                    reasoning=f"Role: {role_name}\nModel: {llm.model}\n\n{reasoning}",
+                )
         parsing_instructions = clean_indents(
             f"""
             The text given to you is trying to give a forecast distribution for a numeric question.
