@@ -11,12 +11,18 @@ on:
         options:
           - minibench
           - benchmarking_questions
+          - learning
           - both
+          - all
       practice:
         description: "Run without publishing to Metaculus"
         required: true
         default: false
         type: boolean
+      max_questions:
+        description: "Maximum questions per target; blank means no limit"
+        required: false
+        default: "3"
   schedule:
     - cron: "7,19,31,43,55 * * * *" # Avoid round-minute GitHub Actions cron congestion.
 
@@ -47,20 +53,31 @@ jobs:
           if [ "$PRACTICE_MODE" = "true" ]; then
             PRACTICE_ARGS+=(--practice)
           fi
+          if [ -n "$MAX_QUESTIONS" ]; then
+            PRACTICE_ARGS+=(--max-questions "$MAX_QUESTIONS")
+            PRACTICE_ARGS+=(--question-shuffle-seed "$GITHUB_RUN_ID")
+          fi
 
           if [ "$TARGET" = "both" ]; then
             MODES=("minibench" "benchmarking_questions")
+          elif [ "$TARGET" = "all" ]; then
+            MODES=("minibench" "benchmarking_questions" "learning")
           else
             MODES=("$TARGET")
           fi
 
           for mode in "${MODES[@]}"; do
             echo "Running practice forecast mode: $mode"
-            poetry run python main.py --mode "$mode" "${PRACTICE_ARGS[@]}"
+            if [ "$mode" = "learning" ]; then
+              poetry run python main.py --mode tournament --tournament-id learning "${PRACTICE_ARGS[@]}"
+            else
+              poetry run python main.py --mode "$mode" "${PRACTICE_ARGS[@]}"
+            fi
           done
         env:
           TARGET: ${{ github.event.inputs.target || 'minibench' }}
           PRACTICE_MODE: ${{ github.event.inputs.practice || 'false' }}
+          MAX_QUESTIONS: ${{ github.event.inputs.max_questions || '' }}
           METACULUS_TOKEN: ${{ secrets.METACULUS_BOT_TOKEN }}
           PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
           EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
@@ -70,6 +87,9 @@ jobs:
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
           EXPERIMENT_MODE: "off"
+          FORECASTER_MAX_TOKENS: "4096"
+          ESCALATION_MAX_TOKENS: "4096"
+          DEEP_RESEARCH_MAX_TOKENS: "4096"
           ENABLE_EXPERIMENT_VARIANTS: "false"
           ALLOW_PUBLISH_EXPERIMENTS: "false"
           ENABLE_EXPERIMENT_LOGGING: "true"

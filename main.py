@@ -158,6 +158,17 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw_value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _env_int(name: str, default: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        return int(raw_value.strip())
+    except ValueError:
+        logger.warning("Invalid integer for %s=%r; using %s", name, raw_value, default)
+        return default
+
+
 def _select_experiment_variant(
     mode: str, requested_variant_id: int | None, seed: int | None
 ) -> tuple[ExperimentVariant | None, int | None]:
@@ -442,6 +453,35 @@ def _write_experiment_logs(
             handle.write(json.dumps(record, ensure_ascii=True) + "\n")
     logger.info("Experiment logs written to %s", run_dir)
     logger.info("Forecast run status: %s - %s", summary["status"], summary["message"])
+
+
+def _get_open_tournament_questions(
+    client: MetaculusClient, tournament_id: str | int
+) -> list[MetaculusQuestion]:
+    method = getattr(client, "get_all_open_questions_from_tournament", None)
+    if method is None:
+        raise AttributeError(
+            "MetaculusClient does not expose get_all_open_questions_from_tournament; "
+            "omit --max-questions to use ForecastBot.forecast_on_tournament directly."
+        )
+    try:
+        return list(method(tournament_id=tournament_id))
+    except TypeError:
+        return list(method(tournament_id))
+
+
+def _select_question_batch(
+    questions: list[MetaculusQuestion],
+    *,
+    max_questions: int | None,
+    shuffle_seed: int | None,
+) -> list[MetaculusQuestion]:
+    if max_questions is None or max_questions <= 0 or len(questions) <= max_questions:
+        return questions
+    selected_questions = list(questions)
+    if shuffle_seed is not None:
+        random.Random(shuffle_seed).shuffle(selected_questions)
+    return selected_questions[:max_questions]
 
 
 class SpringTemplateBot2026(ForecastBot):
@@ -745,6 +785,7 @@ class SpringTemplateBot2026(ForecastBot):
                     temperature=0.25,
                     timeout=240,
                     allowed_tries=2,
+                    max_tokens=_env_int("FORECASTER_MAX_TOKENS", 4096),
                 ),
                 instructions=clean_indents(
                     """
@@ -767,6 +808,7 @@ class SpringTemplateBot2026(ForecastBot):
                     temperature=0.25,
                     timeout=180,
                     allowed_tries=2,
+                    max_tokens=_env_int("FORECASTER_MAX_TOKENS", 4096),
                 ),
                 instructions=clean_indents(
                     """
@@ -789,6 +831,7 @@ class SpringTemplateBot2026(ForecastBot):
                     temperature=0.25,
                     timeout=180,
                     allowed_tries=2,
+                    max_tokens=_env_int("FORECASTER_MAX_TOKENS", 4096),
                 ),
                 instructions=clean_indents(
                     """
@@ -819,6 +862,7 @@ class SpringTemplateBot2026(ForecastBot):
                 temperature=0.2,
                 timeout=180,
                 allowed_tries=2,
+                max_tokens=_env_int("ESCALATION_MAX_TOKENS", 4096),
             ),
             instructions=clean_indents(
                 """
@@ -1117,6 +1161,7 @@ class SpringTemplateBot2026(ForecastBot):
                 temperature=0.1,
                 timeout=360,
                 allowed_tries=2,
+                max_tokens=_env_int("DEEP_RESEARCH_MAX_TOKENS", 4096),
             )
 
         provider = os.getenv("DEEP_RESEARCH_PROVIDER", "auto").strip().lower()
@@ -1127,6 +1172,7 @@ class SpringTemplateBot2026(ForecastBot):
                     temperature=0.1,
                     timeout=360,
                     allowed_tries=2,
+                    max_tokens=_env_int("DEEP_RESEARCH_MAX_TOKENS", 4096),
                     web_search_options={"search_context_size": "high"},
                     reasoning_effort="high",
                 )
@@ -1139,6 +1185,7 @@ class SpringTemplateBot2026(ForecastBot):
                     temperature=0.1,
                     timeout=360,
                     allowed_tries=2,
+                    max_tokens=_env_int("DEEP_RESEARCH_MAX_TOKENS", 4096),
                     web_search_options={"search_context_size": "high"},
                     reasoning_effort="high",
                 )
@@ -1149,6 +1196,7 @@ class SpringTemplateBot2026(ForecastBot):
                 temperature=0.1,
                 timeout=360,
                 allowed_tries=2,
+                max_tokens=_env_int("DEEP_RESEARCH_MAX_TOKENS", 4096),
             )
 
         return None
@@ -3583,6 +3631,26 @@ if __name__ == "__main__":
         help="Run forecasts without publishing to Metaculus. Useful for quick experiments.",
     )
     parser.add_argument(
+        "--max-questions",
+        type=int,
+        default=(
+            int(os.getenv("MAX_QUESTIONS"))
+            if os.getenv("MAX_QUESTIONS", "").strip().isdigit()
+            else None
+        ),
+        help="Limit each tournament target to this many open questions. Useful for bounded benchmark smoke tests.",
+    )
+    parser.add_argument(
+        "--question-shuffle-seed",
+        type=int,
+        default=(
+            int(os.getenv("QUESTION_SHUFFLE_SEED"))
+            if os.getenv("QUESTION_SHUFFLE_SEED", "").strip().isdigit()
+            else None
+        ),
+        help="Shuffle open tournament questions before applying --max-questions.",
+    )
+    parser.add_argument(
         "--experiment-mode",
         choices=["off", "random", "variant"],
         default=default_experiment_mode,
@@ -3673,6 +3741,7 @@ if __name__ == "__main__":
                 temperature=0.25,
                 timeout=180,
                 allowed_tries=2,
+                max_tokens=_env_int("FORECASTER_MAX_TOKENS", 4096),
             ),
             "summarizer": os.getenv(
                 "SUMMARIZER_MODEL", "openrouter/openai/gpt-5-nano"
@@ -3695,13 +3764,37 @@ if __name__ == "__main__":
     if run_mode in ["tournament", "minibench", "benchmarking_questions"]:
         forecast_reports = []
         for tournament_id in target_tournament_ids:
-            forecast_reports.extend(
-                asyncio.run(
-                    template_bot.forecast_on_tournament(
-                        tournament_id, return_exceptions=True
+            if args.max_questions is not None:
+                questions = _get_open_tournament_questions(client, tournament_id)
+                selected_questions = _select_question_batch(
+                    questions,
+                    max_questions=args.max_questions,
+                    shuffle_seed=args.question_shuffle_seed,
+                )
+                logger.info(
+                    "Selected %s of %s open questions from tournament %s "
+                    "(max_questions=%s, shuffle_seed=%s)",
+                    len(selected_questions),
+                    len(questions),
+                    tournament_id,
+                    args.max_questions,
+                    args.question_shuffle_seed,
+                )
+                forecast_reports.extend(
+                    asyncio.run(
+                        template_bot.forecast_questions(
+                            selected_questions, return_exceptions=True
+                        )
                     )
                 )
-            )
+            else:
+                forecast_reports.extend(
+                    asyncio.run(
+                        template_bot.forecast_on_tournament(
+                            tournament_id, return_exceptions=True
+                        )
+                    )
+                )
     elif run_mode == "repredict_tournament":
         # Reforecast all currently open questions in the explicitly targeted tournaments.
         template_bot.skip_previously_forecasted_questions = False
