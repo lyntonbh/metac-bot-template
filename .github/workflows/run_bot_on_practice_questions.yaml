@@ -18,7 +18,7 @@ on:
         default: false
         type: boolean
   schedule:
-    - cron: "*/20 * * * *" # MiniBench questions can have very short forecast windows.
+    - cron: "7,19,31,43,55 * * * *" # Avoid round-minute GitHub Actions cron congestion.
 
 concurrency:
   group: ${{ github.workflow }}
