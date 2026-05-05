@@ -53,6 +53,7 @@ jobs:
           if [ "$PRACTICE_MODE" = "true" ]; then
             PRACTICE_ARGS+=(--practice)
           fi
+          PRACTICE_ARGS+=(--continue-on-question-errors)
           if [ -n "$MAX_QUESTIONS" ]; then
             PRACTICE_ARGS+=(--max-questions "$MAX_QUESTIONS")
             PRACTICE_ARGS+=(--question-shuffle-seed "$GITHUB_RUN_ID")
@@ -92,6 +93,7 @@ jobs:
           DEEP_RESEARCH_MAX_TOKENS: "4096"
           SUMMARIZER_MAX_TOKENS: "2048"
           PARSER_MAX_TOKENS: "1024"
+          CONTINUE_ON_QUESTION_ERRORS: "true"
           ENABLE_SUPPLEMENTAL_WEB_RESEARCH: "false"
           ENABLE_MARKET_PRIOR_RESEARCH: "false"
           ENABLE_OFFICIAL_DATA_RESEARCH: "false"

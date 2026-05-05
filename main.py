@@ -484,6 +484,49 @@ def _select_question_batch(
     return selected_questions[:max_questions]
 
 
+def _looks_like_credit_exhaustion(error: BaseException) -> bool:
+    error_text = repr(error).lower()
+    return any(
+        phrase in error_text
+        for phrase in (
+            "insufficient credits",
+            "requires more credits",
+            "payment required",
+            "quota",
+        )
+    )
+
+
+def _forecast_questions_resiliently(
+    bot: ForecastBot, questions: list[MetaculusQuestion]
+) -> list[Any]:
+    forecast_reports: list[Any] = []
+    for index, question in enumerate(questions, start=1):
+        logger.info(
+            "Forecasting selected question %s/%s: %s",
+            index,
+            len(questions),
+            getattr(question, "page_url", ""),
+        )
+        try:
+            forecast_reports.extend(
+                asyncio.run(bot.forecast_questions([question], return_exceptions=True))
+            )
+        except BaseException as error:
+            forecast_reports.append(error)
+            logger.error(
+                "Question-level forecasting failed for %s: %r",
+                getattr(question, "page_url", ""),
+                error,
+            )
+            if _looks_like_credit_exhaustion(error):
+                logger.error(
+                    "Stopping batch early because the model provider appears to be out of credits/quota."
+                )
+                break
+    return forecast_reports
+
+
 class SpringTemplateBot2026(ForecastBot):
     """
     This is the template bot for Spring 2026 Metaculus AI Tournament.
@@ -3654,6 +3697,12 @@ if __name__ == "__main__":
         help="Shuffle open tournament questions before applying --max-questions.",
     )
     parser.add_argument(
+        "--continue-on-question-errors",
+        action="store_true",
+        default=_env_bool("CONTINUE_ON_QUESTION_ERRORS", False),
+        help="Forecast selected tournament questions one at a time and keep going after per-question failures.",
+    )
+    parser.add_argument(
         "--experiment-mode",
         choices=["off", "random", "variant"],
         default=default_experiment_mode,
@@ -3793,13 +3842,20 @@ if __name__ == "__main__":
                     args.max_questions,
                     args.question_shuffle_seed,
                 )
-                forecast_reports.extend(
-                    asyncio.run(
-                        template_bot.forecast_questions(
-                            selected_questions, return_exceptions=True
+                if args.continue_on_question_errors:
+                    forecast_reports.extend(
+                        _forecast_questions_resiliently(
+                            template_bot, selected_questions
                         )
                     )
-                )
+                else:
+                    forecast_reports.extend(
+                        asyncio.run(
+                            template_bot.forecast_questions(
+                                selected_questions, return_exceptions=True
+                            )
+                        )
+                    )
             else:
                 forecast_reports.extend(
                     asyncio.run(
