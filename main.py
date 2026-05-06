@@ -9,6 +9,7 @@ import random
 import re
 import statistics
 import time
+import unicodedata
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -770,6 +771,53 @@ class SpringTemplateBot2026(ForecastBot):
             "treaty texts, sanctions lists, ACLED/ISW-style conflict trackers, and major wire services"
         ),
     }
+    _market_providers = {"kalshi", "polymarket", "manifold"}
+    _country_alias_terms: dict[str, tuple[str, ...]] = {
+        "argentina": ("argentina", "argentine", "argentinian"),
+        "australia": ("australia", "australian"),
+        "brazil": ("brazil", "brazilian"),
+        "canada": ("canada", "canadian"),
+        "chile": ("chile", "chilean"),
+        "china": ("china", "chinese"),
+        "colombia": ("colombia", "colombian"),
+        "france": ("france", "french"),
+        "germany": ("germany", "german"),
+        "india": ("india", "indian"),
+        "indonesia": ("indonesia", "indonesian"),
+        "iran": ("iran", "iranian"),
+        "israel": ("israel", "israeli"),
+        "italy": ("italy", "italian"),
+        "japan": ("japan", "japanese"),
+        "mexico": ("mexico", "mexican"),
+        "russia": ("russia", "russian"),
+        "south korea": ("south korea", "korea", "korean"),
+        "taiwan": ("taiwan", "taiwanese"),
+        "turkey": ("turkey", "turkish"),
+        "ukraine": ("ukraine", "ukrainian"),
+        "united kingdom": ("united kingdom", "uk", "britain", "british"),
+        "united states": (
+            "united states",
+            "u.s.",
+            "us",
+            "usa",
+            "american",
+        ),
+        "venezuela": ("venezuela", "venezuelan"),
+    }
+    _election_market_terms = {
+        "ballot",
+        "candidate",
+        "election",
+        "electoral",
+        "nominee",
+        "parliament",
+        "president",
+        "presidential",
+        "primary",
+        "runoff",
+        "vote",
+        "winner",
+    }
     _fred_series_by_keyword: dict[str, tuple[str, str]] = {
         "inflation": ("CPIAUCSL", "Consumer Price Index for All Urban Consumers"),
         "cpi": ("CPIAUCSL", "Consumer Price Index for All Urban Consumers"),
@@ -959,6 +1007,7 @@ class SpringTemplateBot2026(ForecastBot):
             - Watch for bait-and-switch errors: answer the question as written, not a nearby easier question.
             - Calibrate uncertainty: avoid both false precision and lazy 50/50 hedging.
             - If markets, expert forecasts, polls, official data, or historical reference classes are relevant, weigh them explicitly.
+            - Include a section headed exactly "Market prior reconciliation" before your final answer. State whether direct Kalshi, Polymarket, Manifold, or other market odds were found; list any implied probability, liquidity/directness caveat, and why your forecast agrees with or deviates from the market. If only weak or irrelevant markets were found, say they were not used.
             """
         )
 
@@ -986,15 +1035,58 @@ class SpringTemplateBot2026(ForecastBot):
             )
         return predictions
 
-    @staticmethod
-    def _combine_model_reasoning(predictions: list[ReasonedPrediction[T]]) -> str:
+    @classmethod
+    def _market_reconciliation_from_predictions(
+        cls, predictions: list[ReasonedPrediction[T]]
+    ) -> str:
+        sections: list[str] = []
+        section_pattern = re.compile(
+            r"(?:^|\n)#{0,3}\s*Market prior reconciliation\s*:?\s*\n(?P<body>.*?)(?=\n#{1,3}\s|\Z)",
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        ordered_predictions = sorted(
+            predictions,
+            key=lambda prediction: (
+                0
+                if "Role: Market / structured-data interpreter"
+                in prediction.reasoning
+                else 1
+                if "Role: Stacker / skeptic adjudicator" in prediction.reasoning
+                else 2
+            ),
+        )
+        for prediction in ordered_predictions:
+            reasoning = prediction.reasoning
+            if "market" not in reasoning.lower():
+                continue
+            for match in section_pattern.finditer(reasoning):
+                body = match.group("body").strip()
+                if body:
+                    sections.append(cls._truncate_for_prompt(body, 1800))
+                    break
+        if sections:
+            return "\n\n".join(sections[:2])
+        return (
+            "No separate market-prior reconciliation was extracted from the role "
+            "outputs. See the market/data role below for any market evidence that "
+            "was found or rejected."
+        )
+
+    @classmethod
+    def _combine_model_reasoning(cls, predictions: list[ReasonedPrediction[T]]) -> str:
         model_rationales = "\n\n".join(
             f"## Role output {i + 1}\n{prediction.reasoning}"
             for i, prediction in enumerate(predictions)
         )
+        market_reconciliation = cls._market_reconciliation_from_predictions(
+            predictions
+        )
         return clean_indents(
             f"""
             Ensemble forecast synthesized from {len(predictions)} successful role-specific forecasts.
+
+            ## Market prior reconciliation
+            {market_reconciliation}
 
             {model_rationales}
             """
@@ -1219,7 +1311,82 @@ class SpringTemplateBot2026(ForecastBot):
             getattr(question, "resolution_criteria", ""),
             getattr(question, "fine_print", ""),
         ]
+        options = getattr(question, "options", None)
+        if options:
+            parts.append(" ".join(str(option) for option in options))
         return "\n".join(str(part) for part in parts if part).lower()
+
+    @staticmethod
+    def _normalise_relevance_text(text: str) -> str:
+        decomposed = unicodedata.normalize("NFKD", str(text))
+        ascii_text = decomposed.encode("ascii", "ignore").decode("ascii")
+        return ascii_text.lower()
+
+    @classmethod
+    def _text_tokens(cls, text: str) -> set[str]:
+        return {
+            word
+            for word in re.findall(
+                r"[a-z][a-z0-9\-]{2,}", cls._normalise_relevance_text(text)
+            )
+            if len(word) > 2
+        }
+
+    @classmethod
+    def _question_option_terms(cls, question: MetaculusQuestion) -> list[set[str]]:
+        option_terms: list[set[str]] = []
+        for option in getattr(question, "options", None) or []:
+            option_text = str(option).strip()
+            if option_text.lower() in {
+                "another",
+                "another candidate",
+                "none",
+                "none of the above",
+                "other",
+                "other candidate",
+            }:
+                continue
+            terms = {
+                term
+                for term in cls._text_tokens(option_text)
+                if term not in cls._stop_words and len(term) > 2
+            }
+            if terms:
+                option_terms.append(terms)
+        return option_terms
+
+    @classmethod
+    def _country_alias_groups_for_question(
+        cls, question: MetaculusQuestion
+    ) -> list[set[str]]:
+        question_blob = cls._normalise_relevance_text(cls._question_text_blob(question))
+        matched_groups: list[set[str]] = []
+        for aliases in cls._country_alias_terms.values():
+            if any(
+                re.search(rf"\b{re.escape(alias.lower())}\b", question_blob)
+                for alias in aliases
+            ):
+                alias_terms = set()
+                for alias in aliases:
+                    alias_terms.update(cls._text_tokens(alias))
+                matched_groups.append(alias_terms)
+        return matched_groups
+
+    @classmethod
+    def _country_names_for_question(cls, question: MetaculusQuestion) -> list[str]:
+        question_blob = cls._normalise_relevance_text(cls._question_text_blob(question))
+        return [
+            country
+            for country, aliases in cls._country_alias_terms.items()
+            if any(
+                re.search(rf"\b{re.escape(alias.lower())}\b", question_blob)
+                for alias in aliases
+            )
+        ]
+
+    @classmethod
+    def _is_election_question(cls, question: MetaculusQuestion) -> bool:
+        return bool(cls._text_tokens(cls._question_text_blob(question)) & cls._election_market_terms)
 
     @classmethod
     def _official_data_topics(cls, question: MetaculusQuestion) -> list[str]:
@@ -1401,11 +1568,9 @@ class SpringTemplateBot2026(ForecastBot):
 
     @classmethod
     def _question_terms(cls, question: MetaculusQuestion) -> set[str]:
-        question_blob = cls._question_text_blob(question)
-        words = set(re.findall(r"[a-zA-Z][a-zA-Z0-9\-]{2,}", question_blob))
         return {
             word.lower()
-            for word in words
+            for word in cls._text_tokens(cls._question_text_blob(question))
             if len(word) > 3 and word.lower() not in cls._stop_words
         }
 
@@ -1414,12 +1579,58 @@ class SpringTemplateBot2026(ForecastBot):
         terms = cls._question_terms(question)
         if not terms:
             return 0.0
-        candidate_words = set(
-            word.lower()
-            for word in re.findall(r"[a-zA-Z][a-zA-Z0-9\-]{2,}", candidate_text)
-        )
+        candidate_words = cls._text_tokens(candidate_text)
         matches = terms & candidate_words
         return len(matches) / max(len(terms), 1)
+
+    @classmethod
+    def _market_relevance_directness(
+        cls,
+        candidate_text: str,
+        question: MetaculusQuestion,
+        score: float,
+    ) -> str | None:
+        candidate_words = cls._text_tokens(candidate_text)
+        if not candidate_words:
+            return None
+
+        option_match = cls._has_option_match(candidate_words, question)
+        country_match = cls._has_country_match(candidate_words, question)
+        election_term_match = bool(candidate_words & cls._election_market_terms)
+
+        if cls._is_election_question(question):
+            if not option_match and not (country_match and election_term_match):
+                return None
+            if option_match and (country_match or election_term_match):
+                return "direct"
+            if score >= 0.12:
+                return "direct" if country_match and election_term_match else "similar"
+            return "similar"
+
+        if score >= 0.18:
+            return "direct"
+        if score >= 0.10:
+            return "similar"
+        return None
+
+    @classmethod
+    def _has_option_match(
+        cls, candidate_words: set[str], question: MetaculusQuestion
+    ) -> bool:
+        for option_terms in cls._question_option_terms(question):
+            required_matches = min(2, len(option_terms))
+            if len(option_terms & candidate_words) >= required_matches:
+                return True
+        return False
+
+    @classmethod
+    def _has_country_match(
+        cls, candidate_words: set[str], question: MetaculusQuestion
+    ) -> bool:
+        return any(
+            bool(alias_group & candidate_words)
+            for alias_group in cls._country_alias_groups_for_question(question)
+        )
 
     @classmethod
     def _directness_from_score(cls, score: float) -> str:
@@ -1911,6 +2122,14 @@ class SpringTemplateBot2026(ForecastBot):
                 continue
             evidence_items.extend(result)
 
+        if not self._env_flag("INCLUDE_WEAK_MARKET_EVIDENCE", False):
+            evidence_items = [
+                item
+                for item in evidence_items
+                if item.provider not in self._market_providers
+                or item.directness != "weak"
+            ]
+
         evidence_items = sorted(
             evidence_items,
             key=lambda item: {"direct": 0, "similar": 1, "weak": 2}.get(
@@ -1982,29 +2201,64 @@ class SpringTemplateBot2026(ForecastBot):
         base_url = os.getenv(
             "KALSHI_API_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2"
         ).rstrip("/")
-        try:
-            payload = await self._http_get_json(
-                f"{base_url}/markets",
-                params={"status": "open", "limit": 1000},
-                timeout=25,
-            )
-        except Exception as error:
-            logger.warning("Kalshi market fetch failed: %r", error)
-            return []
-        markets = payload.get("markets", []) if isinstance(payload, dict) else []
+        markets_by_key: dict[str, dict[str, Any]] = {}
+        params_to_try = [{"status": "open", "limit": 1000}]
+        params_to_try.extend(
+            {"status": "open", "limit": 100, "query": query}
+            for query in self._market_search_queries(question)[:5]
+        )
+        for params in params_to_try:
+            try:
+                payload = await self._http_get_json(
+                    f"{base_url}/markets",
+                    params=params,
+                    timeout=25,
+                )
+            except Exception as error:
+                logger.warning("Kalshi market fetch failed: %r", error)
+                continue
+            markets = payload.get("markets", []) if isinstance(payload, dict) else []
+            for market in markets:
+                if not isinstance(market, dict):
+                    continue
+                key = str(market.get("ticker") or market.get("title") or "")
+                if key:
+                    markets_by_key[key] = market
         evidence_items: list[EvidenceItem] = []
-        for market in markets:
+        for market in markets_by_key.values():
             title = str(market.get("title") or market.get("subtitle") or "")
             candidate_text = " ".join(
                 str(market.get(key, ""))
-                for key in ("title", "subtitle", "rules_primary", "category")
+                for key in (
+                    "title",
+                    "subtitle",
+                    "yes_sub_title",
+                    "no_sub_title",
+                    "rules_primary",
+                    "category",
+                )
             )
             score = self._relevance_score(candidate_text, question)
-            if score < 0.08:
+            directness = self._market_relevance_directness(
+                candidate_text, question, score
+            )
+            if directness is None:
                 continue
             yes_bid = self._normalise_market_probability(market.get("yes_bid"))
             yes_ask = self._normalise_market_probability(market.get("yes_ask"))
             last_price = self._normalise_market_probability(market.get("last_price"))
+            if yes_bid is None:
+                yes_bid = self._normalise_market_probability(
+                    market.get("yes_bid_dollars")
+                )
+            if yes_ask is None:
+                yes_ask = self._normalise_market_probability(
+                    market.get("yes_ask_dollars")
+                )
+            if last_price is None:
+                last_price = self._normalise_market_probability(
+                    market.get("last_price_dollars")
+                )
             probability_values = [
                 value for value in (yes_bid, yes_ask, last_price) if value is not None
             ]
@@ -2027,7 +2281,7 @@ class SpringTemplateBot2026(ForecastBot):
                     value=f"yes_bid={yes_bid}, yes_ask={yes_ask}, last={last_price}",
                     probability=probability,
                     date=str(market.get("close_time") or market.get("expiration_time") or ""),
-                    directness=self._directness_from_score(score),
+                    directness=directness,
                     caveats="Kalshi market may not match Metaculus resolution exactly; verify title/rules.",
                     raw={
                         key: market.get(key)
@@ -2035,8 +2289,11 @@ class SpringTemplateBot2026(ForecastBot):
                             "ticker",
                             "title",
                             "yes_bid",
+                            "yes_bid_dollars",
                             "yes_ask",
+                            "yes_ask_dollars",
                             "last_price",
+                            "last_price_dollars",
                             "volume",
                             "open_interest",
                             "close_time",
@@ -2053,33 +2310,151 @@ class SpringTemplateBot2026(ForecastBot):
             "polymarket", question, lambda: self._fetch_polymarket_markets(question)
         )
 
+    @classmethod
+    def _iter_polymarket_market_payloads(
+        cls, payload: dict[str, Any] | list[Any]
+    ) -> list[dict[str, Any]]:
+        if isinstance(payload, dict):
+            if (
+                isinstance(payload.get("markets"), list)
+                and not payload.get("question")
+                and (payload.get("slug") or payload.get("title") or payload.get("name"))
+            ):
+                payload_items = [payload]
+            else:
+                payload_items = []
+                for key in ("markets", "events"):
+                    value = payload.get(key)
+                    if isinstance(value, list):
+                        payload_items.extend(value)
+                if not payload_items:
+                    payload_items = [payload]
+        elif isinstance(payload, list):
+            payload_items = payload
+        else:
+            payload_items = []
+
+        markets: list[dict[str, Any]] = []
+        for item in payload_items:
+            if not isinstance(item, dict):
+                continue
+            nested_markets = item.get("markets")
+            if isinstance(nested_markets, list):
+                event_title = item.get("title") or item.get("name") or item.get("slug")
+                event_slug = item.get("slug")
+                for market in nested_markets:
+                    if not isinstance(market, dict):
+                        continue
+                    enriched_market = dict(market)
+                    if event_title and not enriched_market.get("eventTitle"):
+                        enriched_market["eventTitle"] = event_title
+                    if event_slug and not enriched_market.get("eventSlug"):
+                        enriched_market["eventSlug"] = event_slug
+                    markets.append(enriched_market)
+            elif item.get("question") or item.get("title"):
+                markets.append(item)
+        return markets
+
+    @classmethod
+    def _slugify_market_query(cls, query: str) -> str:
+        normalized = cls._normalise_relevance_text(query)
+        slug = re.sub(r"[^a-z0-9]+", "-", normalized).strip("-")
+        return re.sub(r"-+", "-", slug)
+
+    @classmethod
+    def _polymarket_candidate_event_slugs(
+        cls, question: MetaculusQuestion
+    ) -> list[str]:
+        slugs: list[str] = []
+        for query in cls._market_search_queries(question):
+            slug = cls._slugify_market_query(query)
+            if slug and slug not in slugs:
+                slugs.append(slug)
+        return slugs[:8]
+
     async def _fetch_polymarket_markets(
         self, question: MetaculusQuestion
     ) -> list[EvidenceItem]:
         gamma_url = os.getenv(
             "POLYMARKET_GAMMA_MARKETS_URL", "https://gamma-api.polymarket.com/markets"
         )
-        try:
-            payload = await self._http_get_json(
-                gamma_url,
-                params={"active": "true", "closed": "false", "limit": 500},
-                timeout=25,
+        events_url = os.getenv(
+            "POLYMARKET_GAMMA_EVENTS_URL",
+            f"{gamma_url.rstrip('/').rsplit('/markets', 1)[0]}/events",
+        )
+        markets_by_key: dict[str, dict[str, Any]] = {}
+        search_queries = self._market_search_queries(question)
+
+        request_specs: list[tuple[str, dict[str, Any]]] = []
+        for query in search_queries[:6]:
+            request_specs.append(
+                (
+                    gamma_url,
+                    {
+                        "active": "true",
+                        "closed": "false",
+                        "limit": 100,
+                        "search": query,
+                    },
+                )
             )
-        except Exception as error:
-            logger.warning("Polymarket market fetch failed: %r", error)
-            return []
-        markets = payload if isinstance(payload, list) else payload.get("markets", [])
-        evidence_items: list[EvidenceItem] = []
-        for market in markets:
-            if not isinstance(market, dict):
+            request_specs.append(
+                (
+                    events_url,
+                    {
+                        "active": "true",
+                        "closed": "false",
+                        "limit": 25,
+                        "search": query,
+                    },
+                )
+            )
+        for slug in self._polymarket_candidate_event_slugs(question):
+            request_specs.append((events_url, {"slug": slug, "limit": 5}))
+        request_specs.append(
+            (
+                gamma_url,
+                {"active": "true", "closed": "false", "limit": 500},
+            )
+        )
+
+        for url, params in request_specs:
+            try:
+                payload = await self._http_get_json(url, params=params, timeout=25)
+            except Exception as error:
+                logger.warning("Polymarket market fetch failed: %r", error)
                 continue
+            for market in self._iter_polymarket_market_payloads(payload):
+                key = str(
+                    market.get("id")
+                    or market.get("conditionId")
+                    or market.get("slug")
+                    or market.get("question")
+                    or ""
+                )
+                if key:
+                    markets_by_key[key] = market
+        evidence_items: list[EvidenceItem] = []
+        for market in markets_by_key.values():
             title = str(market.get("question") or market.get("title") or "")
             candidate_text = " ".join(
                 str(market.get(key, ""))
-                for key in ("question", "title", "description", "category")
+                for key in (
+                    "question",
+                    "title",
+                    "description",
+                    "category",
+                    "slug",
+                    "eventSlug",
+                    "eventTitle",
+                    "groupItemTitle",
+                )
             )
             score = self._relevance_score(candidate_text, question)
-            if score < 0.08:
+            directness = self._market_relevance_directness(
+                candidate_text, question, score
+            )
+            if directness is None:
                 continue
             outcome_prices = self._parse_jsonish_list(market.get("outcomePrices"))
             outcomes = self._parse_jsonish_list(market.get("outcomes"))
@@ -2111,7 +2486,7 @@ class SpringTemplateBot2026(ForecastBot):
                     value=f"outcomes={outcomes}, outcomePrices={outcome_prices}",
                     probability=probability,
                     date=str(market.get("endDate") or market.get("end_date") or ""),
-                    directness=self._directness_from_score(score),
+                    directness=directness,
                     caveats="Polymarket outcomes may map imperfectly to Metaculus criteria; check market rules.",
                     raw={
                         key: market.get(key)
@@ -2123,6 +2498,8 @@ class SpringTemplateBot2026(ForecastBot):
                             "outcomePrices",
                             "volume",
                             "liquidity",
+                            "eventSlug",
+                            "eventTitle",
                             "endDate",
                         )
                     },
@@ -2161,7 +2538,10 @@ class SpringTemplateBot2026(ForecastBot):
                 for key in ("question", "description", "textDescription", "outcomeType")
             )
             score = self._relevance_score(candidate_text, question)
-            if score < 0.06:
+            directness = self._market_relevance_directness(
+                candidate_text, question, score
+            )
+            if directness is None:
                 continue
             probability = self._normalise_market_probability(market.get("probability"))
             url = market.get("url") or (
@@ -2182,7 +2562,7 @@ class SpringTemplateBot2026(ForecastBot):
                     ),
                     probability=probability,
                     date=str(market.get("closeTime") or ""),
-                    directness=self._directness_from_score(score),
+                    directness=directness,
                     caveats="Manifold is often useful for priors but may be thinly traded or community-driven.",
                     raw={
                         key: market.get(key)
@@ -2208,6 +2588,45 @@ class SpringTemplateBot2026(ForecastBot):
         cleaned = re.sub(r"[^a-zA-Z0-9 \-]", " ", cleaned)
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         return cleaned[:140] or question_text[:140]
+
+    @classmethod
+    def _market_search_queries(cls, question: MetaculusQuestion) -> list[str]:
+        queries: list[str] = []
+
+        def add(query: str) -> None:
+            query = re.sub(r"\s+", " ", query).strip()
+            if query and query.lower() not in {item.lower() for item in queries}:
+                queries.append(query[:140])
+
+        question_text = str(getattr(question, "question_text", ""))
+        add(cls._market_search_query(question))
+        for country in cls._country_names_for_question(question):
+            if cls._is_election_question(question):
+                add(f"{country} presidential election")
+                add(f"{country} election")
+            else:
+                add(country)
+
+        option_texts = [
+            str(option).strip()
+            for option in getattr(question, "options", None) or []
+            if str(option).strip().lower()
+            not in {"another", "another candidate", "other", "other candidate"}
+        ]
+        for option_text in option_texts[:6]:
+            add(option_text)
+            for country in cls._country_names_for_question(question)[:2]:
+                add(f"{option_text} {country}")
+                if cls._is_election_question(question):
+                    add(f"{option_text} {country} election")
+
+        for phrase_match in re.finditer(
+            r"\b\d{4}\s+[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,3}\s+election\b",
+            question_text,
+        ):
+            add(phrase_match.group(0))
+
+        return queries[:10]
 
     async def _fetch_cached_fred_series(
         self, question: MetaculusQuestion
@@ -2594,6 +3013,7 @@ class SpringTemplateBot2026(ForecastBot):
             "United Kingdom",
             "France",
             "Germany",
+            "Colombia",
             "India",
             "Pakistan",
             "North Korea",
