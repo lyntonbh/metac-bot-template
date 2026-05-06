@@ -11,10 +11,15 @@ on:
         options:
           - tournament
           - repredict_tournament
+          - question_urls
       tournament_ids:
         description: "Comma-separated tournament slugs/IDs to forecast"
         required: true
         default: "summer-futureeval-2026"
+      question_urls:
+        description: "Comma-separated Metaculus question URLs for question_urls mode"
+        required: false
+        default: ""
   schedule:
     - cron: "*/20 * * * *" # runs every 20 minutes. Make sure to skip already forecasted questions!
 
@@ -71,21 +76,37 @@ jobs:
       - name: Run bot
         if: steps.tournament_window.outputs.should_run == 'true'
         run: |
-          TOURNAMENT_ARGS=()
-          IFS=',' read -ra IDS <<< "$TOURNAMENT_IDS"
-          for id in "${IDS[@]}"; do
-            trimmed="$(echo "$id" | xargs)"
-            if [ -n "$trimmed" ]; then
-              TOURNAMENT_ARGS+=(--tournament-id "$trimmed")
+          RUN_ARGS=()
+          if [ "$RUN_MODE" = "question_urls" ]; then
+            IFS=',' read -ra URLS <<< "$QUESTION_URLS"
+            for url in "${URLS[@]}"; do
+              trimmed="$(echo "$url" | xargs)"
+              if [ -n "$trimmed" ]; then
+                RUN_ARGS+=(--question-url "$trimmed")
+              fi
+            done
+            if [ "${#RUN_ARGS[@]}" -eq 0 ]; then
+              echo "question_urls mode requires at least one question URL." >&2
+              exit 1
             fi
-          done
-          poetry run python main.py --mode "$RUN_MODE" "${TOURNAMENT_ARGS[@]}"
+            RUN_ARGS+=(--continue-on-question-errors)
+          else
+            IFS=',' read -ra IDS <<< "$TOURNAMENT_IDS"
+            for id in "${IDS[@]}"; do
+              trimmed="$(echo "$id" | xargs)"
+              if [ -n "$trimmed" ]; then
+                RUN_ARGS+=(--tournament-id "$trimmed")
+              fi
+            done
+          fi
+          poetry run python main.py --mode "$RUN_MODE" "${RUN_ARGS[@]}"
         # this reads the environment variables from the github repository.
         # Store under Settings --> Secrets and variables --> Actions
         env:
           RUN_MODE: ${{ github.event.inputs.mode || 'tournament' }}
           METACULUS_TOKEN: ${{ secrets.METACULUS_BOT_TOKEN }} # replace this with the name of the variable under which you stored your own Metaculus token
           TOURNAMENT_IDS: ${{ github.event.inputs.tournament_ids || 'summer-futureeval-2026' }}
+          QUESTION_URLS: ${{ github.event.inputs.question_urls || '' }}
           PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
           EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}

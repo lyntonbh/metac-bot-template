@@ -484,6 +484,16 @@ def _select_question_batch(
     return selected_questions[:max_questions]
 
 
+def _split_csv_args(values: list[str] | None) -> list[str]:
+    items: list[str] = []
+    for value in values or []:
+        for item in value.split(","):
+            item = item.strip()
+            if item:
+                items.append(item)
+    return items
+
+
 def _looks_like_credit_exhaustion(error: BaseException) -> bool:
     error_text = repr(error).lower()
     return any(
@@ -3731,6 +3741,7 @@ if __name__ == "__main__":
             "minibench",
             "benchmarking_questions",
             "metaculus_cup",
+            "question_urls",
             "test_questions",
         ],
         default="tournament",
@@ -3741,6 +3752,12 @@ if __name__ == "__main__":
         action="append",
         default=None,
         help="Tournament slug/id to forecast. Can be passed multiple times. Defaults to summer-futureeval-2026 for tournament modes.",
+    )
+    parser.add_argument(
+        "--question-url",
+        action="append",
+        default=None,
+        help="Metaculus question URL to forecast in question_urls mode. Can be passed multiple times or as comma-separated URLs.",
     )
     parser.add_argument(
         "--practice",
@@ -3818,6 +3835,7 @@ if __name__ == "__main__":
         "minibench",
         "benchmarking_questions",
         "metaculus_cup",
+        "question_urls",
         "test_questions",
     ] = args.mode
     assert run_mode in [
@@ -3826,6 +3844,7 @@ if __name__ == "__main__":
         "minibench",
         "benchmarking_questions",
         "metaculus_cup",
+        "question_urls",
         "test_questions",
     ], "Invalid run mode"
 
@@ -3885,14 +3904,21 @@ if __name__ == "__main__":
     )
 
     client = MetaculusClient()
+    manual_question_urls = _split_csv_args(
+        (args.question_url or [])
+        + ([os.getenv("QUESTION_URLS", "")] if os.getenv("QUESTION_URLS") else [])
+    )
     default_tournament_ids_by_mode: dict[str, list[str | int]] = {
         "tournament": ["summer-futureeval-2026"],
         "repredict_tournament": ["summer-futureeval-2026"],
         "minibench": [client.CURRENT_MINIBENCH_ID],
         "benchmarking_questions": ["bot-benchmarking-question-list"],
     }
-    target_tournament_ids: list[str | int] = args.tournament_id or default_tournament_ids_by_mode.get(
-        run_mode, ["summer-futureeval-2026"]
+    target_tournament_ids: list[str | int] = (
+        manual_question_urls
+        if run_mode == "question_urls"
+        else args.tournament_id
+        or default_tournament_ids_by_mode.get(run_mode, ["summer-futureeval-2026"])
     )
     if run_mode in ["tournament", "minibench", "benchmarking_questions"]:
         forecast_reports = []
@@ -3954,6 +3980,20 @@ if __name__ == "__main__":
         forecast_reports = asyncio.run(
             template_bot.forecast_on_tournament(
                 client.CURRENT_METACULUS_CUP_ID, return_exceptions=True
+            )
+        )
+    elif run_mode == "question_urls":
+        if not manual_question_urls:
+            raise ValueError(
+                "question_urls mode requires at least one --question-url or QUESTION_URLS value."
+            )
+        template_bot.skip_previously_forecasted_questions = False
+        questions = [client.get_question_by_url(url) for url in manual_question_urls]
+        forecast_reports = (
+            _forecast_questions_resiliently(template_bot, questions)
+            if args.continue_on_question_errors
+            else asyncio.run(
+                template_bot.forecast_questions(questions, return_exceptions=True)
             )
         )
     elif run_mode == "test_questions":
