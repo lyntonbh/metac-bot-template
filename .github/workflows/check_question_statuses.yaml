@@ -1,0 +1,130 @@
+name: Check Metaculus question statuses
+
+on:
+  workflow_dispatch:
+    inputs:
+      question_ids:
+        description: "Comma-separated Metaculus post IDs to check"
+        required: true
+        default: "43411,43412,43413,43416,39814,40184,40289,40598,40603,40730,40963,40965,40976,41087,41089,41090,41140,41141,41142,41144,41172,41193,41206,42476,42517,42630,43167,43259,43283"
+
+jobs:
+  status_check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+      - name: Install poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          installer-parallel: true
+      - name: Install dependencies
+        run: poetry install --no-interaction --no-root
+      - name: Check statuses
+        env:
+          METACULUS_TOKEN: ${{ secrets.METACULUS_BOT_TOKEN }}
+          QUESTION_IDS: ${{ github.event.inputs.question_ids }}
+        run: |
+          poetry run python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          from forecasting_tools import MetaculusClient
+
+          output_dir = Path("question_statuses")
+          output_dir.mkdir(exist_ok=True)
+          ids = [
+              int(item.strip())
+              for item in os.environ["QUESTION_IDS"].split(",")
+              if item.strip()
+          ]
+          client = MetaculusClient()
+
+          def iso(value):
+              return value.isoformat() if value is not None else None
+
+          def state_value(question):
+              state = getattr(question, "state", None)
+              return getattr(state, "value", state)
+
+          records = []
+          for post_id in ids:
+              try:
+                  question_or_questions = client.get_question_by_post_id(post_id)
+                  questions = (
+                      question_or_questions
+                      if isinstance(question_or_questions, list)
+                      else [question_or_questions]
+                  )
+                  for question in questions:
+                      typed_resolution = getattr(question, "typed_resolution", None)
+                      records.append(
+                          {
+                              "post_id": question.id_of_post,
+                              "question_id": question.id_of_question,
+                              "type": question.get_api_type_name(),
+                              "title": question.question_text,
+                              "page_url": question.page_url,
+                              "state": state_value(question),
+                              "close_time": iso(question.close_time),
+                              "scheduled_resolution_time": iso(
+                                  question.scheduled_resolution_time
+                              ),
+                              "actual_resolution_time": iso(
+                                  question.actual_resolution_time
+                              ),
+                              "resolution_string": question.resolution_string,
+                              "typed_resolution": str(typed_resolution)
+                              if typed_resolution is not None
+                              else None,
+                              "already_forecasted": question.already_forecasted,
+                              "tournament_slugs": question.tournament_slugs,
+                          }
+                      )
+              except Exception as error:
+                  records.append(
+                      {
+                          "post_id": post_id,
+                          "state": "error",
+                          "error": repr(error),
+                      }
+                  )
+
+          (output_dir / "question_statuses.json").write_text(
+              json.dumps(records, indent=2), encoding="utf-8"
+          )
+
+          lines = ["# Metaculus Question Statuses", ""]
+          for record in records:
+              title = record.get("title") or record.get("error", "")
+              lines.append(
+                  f"- `{record.get('post_id')}` | {record.get('state')} | "
+                  f"resolution `{record.get('resolution_string')}` | "
+                  f"scheduled `{record.get('scheduled_resolution_time')}` | "
+                  f"actual `{record.get('actual_resolution_time')}` | {title}"
+              )
+          (output_dir / "question_statuses.md").write_text(
+              "\n".join(lines) + "\n", encoding="utf-8"
+          )
+          PY
+      - name: Write job summary
+        if: always()
+        run: |
+          if [ -f question_statuses/question_statuses.md ]; then
+            cat question_statuses/question_statuses.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No status report was produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload status report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metaculus-question-statuses-${{ github.run_id }}
+          path: question_statuses/
+          if-no-files-found: ignore
