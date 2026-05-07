@@ -39,6 +39,11 @@ jobs:
       - uses: actions/setup-python@v4
         with:
           python-version: "3.11"
+      - name: Check OpenRouter key budget
+        run: python scripts/check_openrouter_budget.py
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_BOT_TOKEN }}
+          OPENROUTER_MIN_CREDITS_REMAINING: "0.05"
       - name: Install poetry
         uses: snok/install-poetry@v1
         with:
@@ -78,7 +83,7 @@ jobs:
         env:
           TARGET: ${{ github.event.inputs.target || 'minibench' }}
           PRACTICE_MODE: ${{ github.event.inputs.practice || 'false' }}
-          MAX_QUESTIONS: ${{ github.event.inputs.max_questions || '' }}
+          MAX_QUESTIONS: ${{ github.event_name == 'schedule' && '3' || github.event.inputs.max_questions }}
           METACULUS_TOKEN: ${{ secrets.METACULUS_BOT_TOKEN }}
           PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
           EXA_API_KEY: ${{ secrets.EXA_API_KEY }}

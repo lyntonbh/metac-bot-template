@@ -56,6 +56,12 @@ jobs:
         if: steps.tournament_window.outputs.should_run == 'true'
         with:
           python-version: "3.11"
+      - name: Check OpenRouter key budget
+        if: steps.tournament_window.outputs.should_run == 'true'
+        run: python scripts/check_openrouter_budget.py
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_BOT_TOKEN }}
+          OPENROUTER_MIN_CREDITS_REMAINING: "0.05"
       - name: Install poetry
         if: steps.tournament_window.outputs.should_run == 'true'
         uses: snok/install-poetry@v1

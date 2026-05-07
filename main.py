@@ -4432,7 +4432,12 @@ if __name__ == "__main__":
         forecast_reports = asyncio.run(
             template_bot.forecast_questions(questions, return_exceptions=True)
         )
-    template_bot.log_report_summary(forecast_reports)
+    summary_error: Exception | None = None
+    try:
+        template_bot.log_report_summary(forecast_reports)
+    except Exception as error:
+        summary_error = error
+        logger.error("Forecast report summary found errors: %r", error)
     _write_experiment_logs(
         forecast_reports,
         run_id=run_id,
@@ -4443,3 +4448,18 @@ if __name__ == "__main__":
         experiment_seed=experiment_seed,
         publish_reports=publish_reports,
     )
+    if summary_error is not None:
+        successful_reports = [
+            report
+            for report in forecast_reports
+            if not isinstance(report, BaseException)
+        ]
+        if args.continue_on_question_errors and successful_reports:
+            logger.warning(
+                "Continuing despite %s report summary error(s) because "
+                "--continue-on-question-errors is enabled and %s forecast(s) succeeded.",
+                len(forecast_reports) - len(successful_reports),
+                len(successful_reports),
+            )
+        else:
+            raise summary_error
