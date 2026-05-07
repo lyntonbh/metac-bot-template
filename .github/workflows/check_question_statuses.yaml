@@ -56,7 +56,14 @@ jobs:
           records = []
           for post_id in ids:
               try:
-                  question_or_questions = client.get_question_by_post_id(post_id)
+                  try:
+                      question_or_questions = client.get_question_by_post_id(post_id)
+                  except ValueError as error:
+                      if "got 0" not in str(error):
+                          raise
+                      question_or_questions = client.get_question_by_post_id(
+                          post_id, group_question_mode="unpack_subquestions"
+                      )
                   questions = (
                       question_or_questions
                       if isinstance(question_or_questions, list)
