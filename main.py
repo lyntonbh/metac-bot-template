@@ -495,6 +495,17 @@ def _split_csv_args(values: list[str] | None) -> list[str]:
     return items
 
 
+def _dedupe_preserving_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique_items: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        unique_items.append(item)
+    return unique_items
+
+
 def _looks_like_credit_exhaustion(error: BaseException) -> bool:
     error_text = repr(error).lower()
     return any(
@@ -4324,9 +4335,11 @@ if __name__ == "__main__":
     )
 
     client = MetaculusClient()
-    manual_question_urls = _split_csv_args(
-        (args.question_url or [])
-        + ([os.getenv("QUESTION_URLS", "")] if os.getenv("QUESTION_URLS") else [])
+    manual_question_urls = _dedupe_preserving_order(
+        _split_csv_args(
+            (args.question_url or [])
+            + ([os.getenv("QUESTION_URLS", "")] if os.getenv("QUESTION_URLS") else [])
+        )
     )
     default_tournament_ids_by_mode: dict[str, list[str | int]] = {
         "tournament": ["summer-futureeval-2026"],
