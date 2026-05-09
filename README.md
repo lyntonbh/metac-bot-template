@@ -30,6 +30,8 @@ The bot should just work as is at this point. You can disable the workflow by cl
 ## API Keys
 Instructions for getting your METACULUS_TOKEN, OPENROUTER_API_KEY, or optional search provider API keys (AskNews, Exa, Perplexity, etc) are listed on the "Getting Started" section of the [resources](https://www.metaculus.com/notebooks/38928/ai-benchmark-resources/#want-to-join-the-ai-forecasting-benchmark) page.
 
+By default this template uses `RESEARCHER_MODEL=random` with `RESEARCHER_RANDOM_MODELS=asknews/news-summaries,perplexity,exa`. Each question deterministically chooses one available researcher from that list, so experiment logs can be compared later. AskNews requires `ASKNEWS_CLIENT_ID` plus `ASKNEWS_SECRET`, Perplexity uses `PERPLEXITY_API_KEY` directly or falls back to `OPENROUTER_API_KEY` with `openrouter/perplexity/sonar-pro`, and Exa requires `EXA_API_KEY`. `RESEARCHER_FALLBACK_MODEL=exa` means Exa is used if AskNews or Perplexity is configured but fails. To pin a single provider, set `RESEARCHER_MODEL=asknews/news-summaries`, `RESEARCHER_MODEL=perplexity`, or `RESEARCHER_MODEL=exa`.
+
 ## Changing the Github automation
 You can change which file is run in the GitHub automation by either changing the content of `main.py` to the contents of `main_with_no_framwork.py` (or another script) or by chaging all references to `main.py` to another script in `.github/workflows/run_bot_on_tournament.yaml` and related files.
 

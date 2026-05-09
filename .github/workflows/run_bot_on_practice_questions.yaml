@@ -42,7 +42,7 @@ jobs:
       - name: Check OpenRouter key budget
         run: python scripts/check_openrouter_budget.py
         env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_BOT_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_BOT_TOKEN || secrets.OPENROUTER_API_KEY }}
           OPENROUTER_MIN_CREDITS_REMAINING: "0.05"
       - name: Install poetry
         uses: snok/install-poetry@v1
@@ -84,11 +84,12 @@ jobs:
           TARGET: ${{ github.event.inputs.target || 'minibench' }}
           PRACTICE_MODE: ${{ github.event.inputs.practice || 'false' }}
           MAX_QUESTIONS: ${{ github.event_name == 'schedule' && '3' || github.event.inputs.max_questions }}
-          METACULUS_TOKEN: ${{ secrets.METACULUS_BOT_TOKEN }}
+          METACULUS_TOKEN: ${{ secrets.METACULUS_BOT_TOKEN || secrets.METACULUS_TOKEN }}
           PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
           EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_BOT_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_BOT_TOKEN || secrets.OPENROUTER_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}

@@ -27,7 +27,7 @@ jobs:
         run: poetry install --no-interaction --no-root
       - name: Check statuses
         env:
-          METACULUS_TOKEN: ${{ secrets.METACULUS_BOT_TOKEN }}
+          METACULUS_TOKEN: ${{ secrets.METACULUS_BOT_TOKEN || secrets.METACULUS_TOKEN }}
           QUESTION_IDS: ${{ github.event.inputs.question_ids }}
         run: |
           poetry run python - <<'PY'

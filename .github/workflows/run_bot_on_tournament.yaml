@@ -60,7 +60,7 @@ jobs:
         if: steps.tournament_window.outputs.should_run == 'true'
         run: python scripts/check_openrouter_budget.py
         env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_BOT_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_BOT_TOKEN || secrets.OPENROUTER_API_KEY }}
           OPENROUTER_MIN_CREDITS_REMAINING: "0.05"
       - name: Install poetry
         if: steps.tournament_window.outputs.should_run == 'true'
@@ -110,13 +110,14 @@ jobs:
         # Store under Settings --> Secrets and variables --> Actions
         env:
           RUN_MODE: ${{ github.event.inputs.mode || 'tournament' }}
-          METACULUS_TOKEN: ${{ secrets.METACULUS_BOT_TOKEN }} # replace this with the name of the variable under which you stored your own Metaculus token
+          METACULUS_TOKEN: ${{ secrets.METACULUS_BOT_TOKEN || secrets.METACULUS_TOKEN }} # replace this with the name of the variable under which you stored your own Metaculus token
           TOURNAMENT_IDS: ${{ github.event.inputs.tournament_ids || 'summer-futureeval-2026' }}
           QUESTION_URLS: ${{ github.event.inputs.question_urls || '' }}
           PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
           EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_BOT_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_BOT_TOKEN || secrets.OPENROUTER_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}

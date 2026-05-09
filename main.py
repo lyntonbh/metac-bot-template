@@ -16,6 +16,8 @@ from pathlib import Path
 import dotenv
 from typing import Any, Literal, TypeVar
 
+dotenv.load_dotenv()
+
 import requests
 
 from forecasting_tools import (
@@ -168,6 +170,75 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         logger.warning("Invalid integer for %s=%r; using %s", name, raw_value, default)
         return default
+
+
+def _env_is_set(name: str) -> bool:
+    return bool(os.getenv(name, "").strip())
+
+
+def _required_key_for_model(model: str) -> str | None:
+    if model.startswith("openrouter/"):
+        return "OPENROUTER_API_KEY"
+    if model.startswith("openai/"):
+        return "OPENAI_API_KEY"
+    if model.startswith("perplexity/"):
+        return "PERPLEXITY_API_KEY"
+    if model.startswith("anthropic/"):
+        return "ANTHROPIC_API_KEY"
+    if model.startswith("exa/"):
+        return "EXA_API_KEY"
+    return None
+
+
+def _log_startup_key_status() -> None:
+    if not _env_is_set("METACULUS_TOKEN"):
+        logger.warning(
+            "METACULUS_TOKEN is not set. The bot will not be able to publish forecasts to Metaculus."
+        )
+
+    configured_models = {
+        "DEFAULT_FORECASTER_MODEL": os.getenv(
+            "DEFAULT_FORECASTER_MODEL", "openrouter/mistralai/mistral-large-2512"
+        ),
+        "SUMMARIZER_MODEL": os.getenv("SUMMARIZER_MODEL", "openrouter/openai/gpt-5-nano"),
+        "PARSER_MODEL": os.getenv("PARSER_MODEL", "openrouter/openai/gpt-5-nano"),
+        "ESCALATION_FORECASTER_MODEL": os.getenv(
+            "ESCALATION_FORECASTER_MODEL", "openrouter/openai/gpt-5.5"
+        ),
+    }
+    missing_model_keys = sorted(
+        {
+            required_key
+            for model in configured_models.values()
+            if (required_key := _required_key_for_model(model))
+            and not _env_is_set(required_key)
+        }
+    )
+    if missing_model_keys:
+        logger.warning(
+            "Missing model API key(s): %s. Configured LLM calls may fail.",
+            ", ".join(missing_model_keys),
+        )
+
+    researcher = os.getenv("RESEARCHER_MODEL", "random").strip()
+    fallback = os.getenv("RESEARCHER_FALLBACK_MODEL", "exa").strip()
+    if researcher.startswith("asknews/") and (
+        not _env_is_set("ASKNEWS_CLIENT_ID") or not _env_is_set("ASKNEWS_SECRET")
+    ):
+        logger.warning(
+            "AskNews is configured but ASKNEWS_CLIENT_ID/ASKNEWS_SECRET are not set. "
+            "Configured research will fall back to %s.",
+            fallback or "no fallback",
+        )
+    if researcher in {"exa", "exa/auto"} or fallback in {"exa", "exa/auto"}:
+        if not _env_is_set("EXA_API_KEY"):
+            logger.warning("Exa researcher is configured but EXA_API_KEY is not set.")
+    if fallback in {"perplexity", "sonar", "perplexity/auto"} and not (
+        _env_is_set("PERPLEXITY_API_KEY") or _env_is_set("OPENROUTER_API_KEY")
+    ):
+        logger.warning(
+            "Perplexity fallback is configured but neither PERPLEXITY_API_KEY nor OPENROUTER_API_KEY is set."
+        )
 
 
 def _select_experiment_variant(
@@ -422,6 +493,13 @@ def _write_experiment_logs(
                 "ENABLE_OFFICIAL_DATA_RESEARCH",
                 "ENABLE_DEEP_RESEARCH_ON_DISAGREEMENT",
                 "ENABLE_DEEP_RESEARCH_ON_HIGH_VALUE",
+                "RESEARCHER_MODEL",
+                "RESEARCHER_FALLBACK_MODEL",
+                "RESEARCHER_RANDOM_MODELS",
+                "RESEARCHER_RANDOM_SEED",
+                "PERPLEXITY_RESEARCHER_MODEL",
+                "OPENROUTER_PERPLEXITY_RESEARCHER_MODEL",
+                "EXA_RESEARCHER_MODEL",
             )
         },
         "forecast_summary": summary,
@@ -598,7 +676,7 @@ class SpringTemplateBot2026(ForecastBot):
                 allowed_tries=2,
             ),
             "summarizer": "openai/gpt-5-nano",
-            "researcher": "asknews/news-summaries",
+            "researcher": "random",
             "parser": "openai/gpt-5-nano",
         },
     )
@@ -608,6 +686,8 @@ class SpringTemplateBot2026(ForecastBot):
     ```python
     research_strategy = self.get_llm("researcher", "model_name"
     if research_strategy == "asknews/news-summaries":
+        ...
+    elif research_strategy == "random":
         ...
     # OR
     summarizer = await self.get_llm("summarizer", "llm").invoke(prompt)
@@ -1478,6 +1558,136 @@ class SpringTemplateBot2026(ForecastBot):
         return None
 
     @classmethod
+    def _perplexity_research_llm(cls, researcher: str) -> GeneralLlm | None:
+        requested_model = researcher.strip()
+        if requested_model in {"perplexity", "sonar", "perplexity/auto"}:
+            if os.getenv("PERPLEXITY_API_KEY"):
+                model = os.getenv("PERPLEXITY_RESEARCHER_MODEL", "perplexity/sonar-pro")
+            elif os.getenv("OPENROUTER_API_KEY"):
+                model = os.getenv(
+                    "OPENROUTER_PERPLEXITY_RESEARCHER_MODEL",
+                    "openrouter/perplexity/sonar-pro",
+                )
+            else:
+                logger.warning(
+                    "Perplexity researcher configured but neither PERPLEXITY_API_KEY nor OPENROUTER_API_KEY is set."
+                )
+                return None
+        else:
+            model = requested_model
+            if model.startswith("perplexity/") and not os.getenv("PERPLEXITY_API_KEY"):
+                logger.warning(
+                    "Perplexity researcher model %s requires PERPLEXITY_API_KEY; skipping configured research.",
+                    model,
+                )
+                return None
+            if model.startswith("openrouter/perplexity/") and not os.getenv("OPENROUTER_API_KEY"):
+                logger.warning(
+                    "OpenRouter Perplexity researcher model %s requires OPENROUTER_API_KEY; skipping configured research.",
+                    model,
+                )
+                return None
+
+        return GeneralLlm(
+            model=model,
+            temperature=0.1,
+            timeout=_env_int("RESEARCHER_TIMEOUT_SECONDS", 240),
+            allowed_tries=2,
+            max_tokens=_env_int("RESEARCHER_MAX_TOKENS", 4096),
+            web_search_options={"search_context_size": "high"},
+            reasoning_effort="high",
+        )
+
+    @classmethod
+    def _exa_research_llm(cls, researcher: str) -> GeneralLlm | None:
+        requested_model = researcher.strip()
+        if requested_model in {"exa", "exa/auto"}:
+            model = os.getenv("EXA_RESEARCHER_MODEL", "exa/exa")
+        else:
+            model = requested_model
+        if not os.getenv("EXA_API_KEY"):
+            logger.warning(
+                "Exa researcher model %s requires EXA_API_KEY; skipping configured research.",
+                model,
+            )
+            return None
+        return GeneralLlm(
+            model=model,
+            temperature=0.1,
+            timeout=_env_int("RESEARCHER_TIMEOUT_SECONDS", 240),
+            allowed_tries=2,
+            max_tokens=_env_int("RESEARCHER_MAX_TOKENS", 4096),
+        )
+
+    @classmethod
+    def _random_researcher_candidates(cls) -> list[str]:
+        raw_candidates = os.getenv(
+            "RESEARCHER_RANDOM_MODELS",
+            "asknews/news-summaries,perplexity,exa",
+        )
+        return [
+            candidate.strip()
+            for candidate in raw_candidates.split(",")
+            if candidate.strip()
+        ]
+
+    @classmethod
+    def _researcher_candidate_is_available(cls, researcher: str) -> bool:
+        if researcher.startswith("asknews/"):
+            return bool(os.getenv("ASKNEWS_CLIENT_ID") and os.getenv("ASKNEWS_SECRET"))
+        if (
+            researcher in {"perplexity", "sonar", "perplexity/auto"}
+            or researcher.startswith("perplexity/")
+        ):
+            return bool(os.getenv("PERPLEXITY_API_KEY") or os.getenv("OPENROUTER_API_KEY"))
+        if researcher.startswith("openrouter/perplexity/"):
+            return bool(os.getenv("OPENROUTER_API_KEY"))
+        if researcher in {"exa", "exa/auto"} or researcher.startswith("exa/"):
+            return bool(os.getenv("EXA_API_KEY"))
+        return True
+
+    @classmethod
+    def _select_random_researcher(cls, question: MetaculusQuestion) -> str:
+        candidates = cls._random_researcher_candidates()
+        available_candidates = [
+            candidate
+            for candidate in candidates
+            if cls._researcher_candidate_is_available(candidate)
+        ]
+        if not available_candidates:
+            logger.warning(
+                "No configured random researcher candidates have the needed API keys; using full candidate list."
+            )
+            available_candidates = candidates or ["perplexity"]
+        question_key = (
+            str(getattr(question, "id", "") or getattr(question, "id_of_post", ""))
+            or getattr(question, "page_url", "")
+            or getattr(question, "question_text", "")
+        )
+        seed = os.getenv("RESEARCHER_RANDOM_SEED", "").strip()
+        digest = hashlib.sha256(f"{seed}:{question_key}".encode("utf-8")).hexdigest()
+        return available_candidates[int(digest[:12], 16) % len(available_candidates)]
+
+    async def _run_fallback_researcher(
+        self,
+        prompt: str,
+        question: MetaculusQuestion,
+        reason: str,
+    ) -> str:
+        fallback = os.getenv("RESEARCHER_FALLBACK_MODEL", "exa").strip()
+        if not fallback or fallback in {"None", "no_research"}:
+            return ""
+        logger.warning(
+            "Falling back from configured researcher to %s for %s: %s",
+            fallback,
+            question.page_url,
+            reason,
+        )
+        return await self._run_configured_researcher(
+            fallback, prompt, question, allow_fallback=False
+        )
+
+    @classmethod
     def _cache_ttl_seconds(cls) -> int:
         raw_value = os.getenv("DIRECT_EVIDENCE_CACHE_HOURS", "6")
         try:
@@ -1856,7 +2066,7 @@ class SpringTemplateBot2026(ForecastBot):
 
             research_tasks = [
                 (
-                    "AskNews / configured research",
+                    "Configured research",
                     self._run_configured_researcher(researcher, prompt, question),
                 )
             ]
@@ -1975,9 +2185,24 @@ class SpringTemplateBot2026(ForecastBot):
         researcher: str | GeneralLlm,
         prompt: str,
         question: MetaculusQuestion,
+        allow_fallback: bool = True,
     ) -> str:
         if isinstance(researcher, GeneralLlm):
             return await researcher.invoke(prompt)
+        researcher = researcher.strip()
+        if researcher in {"random", "random-researcher", "researcher-random"}:
+            selected_researcher = self._select_random_researcher(question)
+            logger.info(
+                "Random researcher selected %s for %s",
+                selected_researcher,
+                question.page_url,
+            )
+            result = await self._run_configured_researcher(
+                selected_researcher, prompt, question, allow_fallback=allow_fallback
+            )
+            if result.strip():
+                return f"Selected random researcher: {selected_researcher}\n\n{result}"
+            return result
         elif (
             researcher == "asknews/news-summaries"
             or researcher == "asknews/deep-research/low-depth"
@@ -1989,15 +2214,51 @@ class SpringTemplateBot2026(ForecastBot):
                     "AskNews researcher configured but ASKNEWS_CLIENT_ID/ASKNEWS_SECRET are missing; skipping AskNews research for %s.",
                     question.page_url,
                 )
+                if allow_fallback:
+                    return await self._run_fallback_researcher(
+                        prompt, question, "AskNews credentials are missing"
+                    )
                 return ""
             asknews_query = (
                 question.question_text
                 if researcher == "asknews/news-summaries"
                 else prompt
             )
-            return await AskNewsSearcher().call_preconfigured_version(
-                researcher, asknews_query
-            )
+            try:
+                return await AskNewsSearcher().call_preconfigured_version(
+                    researcher, asknews_query
+                )
+            except Exception as exc:
+                if allow_fallback:
+                    return await self._run_fallback_researcher(
+                        prompt, question, f"AskNews failed with {exc!r}"
+                    )
+                raise
+        elif (
+            researcher in {"perplexity", "sonar", "perplexity/auto"}
+            or researcher.startswith("perplexity/")
+            or researcher.startswith("openrouter/perplexity/")
+        ):
+            perplexity_llm = self._perplexity_research_llm(researcher)
+            if perplexity_llm is None:
+                if allow_fallback:
+                    return await self._run_fallback_researcher(
+                        prompt, question, "Perplexity credentials are missing"
+                    )
+                return ""
+            try:
+                return await perplexity_llm.invoke(prompt)
+            except Exception as exc:
+                if allow_fallback:
+                    return await self._run_fallback_researcher(
+                        prompt, question, f"Perplexity failed with {exc!r}"
+                    )
+                raise
+        elif researcher in {"exa", "exa/auto"} or researcher.startswith("exa/"):
+            exa_llm = self._exa_research_llm(researcher)
+            if exa_llm is None:
+                return ""
+            return await exa_llm.invoke(prompt)
         elif researcher.startswith("smart-searcher"):
             model_name = researcher.removeprefix("smart-searcher/")
             searcher = SmartSearcher(
@@ -4296,6 +4557,7 @@ if __name__ == "__main__":
             "Pass --allow-publish-experiments to override."
         )
         publish_reports = False
+    _log_startup_key_status()
 
     template_bot = SpringTemplateBot2026(
         research_reports_per_question=1,
@@ -4330,7 +4592,7 @@ if __name__ == "__main__":
                 allowed_tries=2,
                 max_tokens=_env_int("PARSER_MAX_TOKENS", 1024),
             ),
-            "researcher": os.getenv("RESEARCHER_MODEL", "asknews/news-summaries"),
+            "researcher": os.getenv("RESEARCHER_MODEL", "random"),
         },
     )
 
