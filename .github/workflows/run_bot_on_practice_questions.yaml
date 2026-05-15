@@ -6,7 +6,7 @@ on:
       target:
         description: "Practice target"
         required: true
-        default: "minibench"
+        default: "both"
         type: choice
         options:
           - minibench
@@ -81,7 +81,7 @@ jobs:
             fi
           done
         env:
-          TARGET: ${{ github.event.inputs.target || 'minibench' }}
+          TARGET: ${{ github.event_name == 'schedule' && 'both' || github.event.inputs.target || 'both' }}
           PRACTICE_MODE: ${{ github.event.inputs.practice || 'false' }}
           MAX_QUESTIONS: ${{ github.event_name == 'schedule' && '3' || github.event.inputs.max_questions }}
           METACULUS_TOKEN: ${{ secrets.METACULUS_BOT_TOKEN || secrets.METACULUS_TOKEN }}
