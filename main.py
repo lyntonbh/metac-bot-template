@@ -10,7 +10,7 @@ import re
 import statistics
 import time
 import unicodedata
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 import dotenv
@@ -81,6 +81,31 @@ class ExperimentVariant:
     name: str
     description: str
     env_overrides: dict[str, str]
+
+
+@dataclass
+class RefreshScoutDecision:
+    question_id: int | None
+    post_id: int | None
+    page_url: str | None
+    question_title: str
+    question_type: str
+    previous_forecast: str
+    previous_forecast_timestamp: str | None
+    should_reforecast: bool
+    recommended_action: str
+    confidence_in_movement: str
+    movement_reason: str
+    fresh_evidence_summary: str
+    estimated_new_forecast: float | None = None
+    estimated_new_probabilities: dict[str, float] | None = None
+    material_distribution_shift: bool = False
+    fresh_high_signal_evidence: bool = False
+    prior_reasoning_stale: bool = False
+    raw_response: str = ""
+    parse_error: str | None = None
+    gate_triggered: bool = False
+    gate_reasons: list[str] = field(default_factory=list)
 
 
 EXPERIMENT_VARIANTS: tuple[ExperimentVariant, ...] = (
@@ -172,6 +197,17 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        return float(raw_value.strip())
+    except ValueError:
+        logger.warning("Invalid float for %s=%r; using %s", name, raw_value, default)
+        return default
+
+
 def _env_is_set(name: str) -> bool:
     return bool(os.getenv(name, "").strip())
 
@@ -205,6 +241,7 @@ def _log_startup_key_status() -> None:
         "ESCALATION_FORECASTER_MODEL": os.getenv(
             "ESCALATION_FORECASTER_MODEL", "openrouter/openai/gpt-5.5"
         ),
+        "SCOUT_MODEL": os.getenv("SCOUT_MODEL", "openrouter/z-ai/glm-5.1"),
     }
     missing_model_keys = sorted(
         {
@@ -481,6 +518,7 @@ def _write_experiment_logs(
                 "INSIDE_VIEW_FORECASTER_MODEL",
                 "MARKET_DATA_FORECASTER_MODEL",
                 "ESCALATION_FORECASTER_MODEL",
+                "SCOUT_MODEL",
                 "SUMMARIZER_MODEL",
                 "PARSER_MODEL",
             )
@@ -497,6 +535,7 @@ def _write_experiment_logs(
                 "RESEARCHER_FALLBACK_MODEL",
                 "RESEARCHER_RANDOM_MODELS",
                 "RESEARCHER_RANDOM_SEED",
+                "SCOUT_RESEARCHER_MODEL",
                 "PERPLEXITY_RESEARCHER_MODEL",
                 "OPENROUTER_PERPLEXITY_RESEARCHER_MODEL",
                 "EXA_RESEARCHER_MODEL",
@@ -2189,6 +2228,460 @@ class SpringTemplateBot2026(ForecastBot):
             {question.fine_print}
             """
         )
+
+    @staticmethod
+    def _prediction_timestamp(prediction: Any) -> datetime | None:
+        timestamp = getattr(prediction, "timestamp", None) or getattr(
+            prediction, "timestamp_start", None
+        )
+        return timestamp if isinstance(timestamp, datetime) else None
+
+    @classmethod
+    def _latest_previous_forecast(cls, question: MetaculusQuestion) -> Any | None:
+        previous_forecasts = getattr(question, "previous_forecasts", None) or []
+        if not previous_forecasts:
+            return None
+        return max(
+            previous_forecasts,
+            key=lambda prediction: cls._prediction_timestamp(prediction)
+            or datetime.min.replace(tzinfo=timezone.utc),
+        )
+
+    @staticmethod
+    def _readable_prediction(prediction: Any | None) -> str:
+        if prediction is None:
+            return "No previous forecast found."
+        try:
+            from forecasting_tools.data_models.data_organizer import DataOrganizer
+
+            return DataOrganizer.get_readable_prediction(prediction)  # type: ignore[arg-type]
+        except Exception:
+            if hasattr(prediction, "model_dump"):
+                return json.dumps(prediction.model_dump(mode="json"), ensure_ascii=True)
+            return str(prediction)
+
+    @staticmethod
+    def _coerce_probability(value: Any) -> float | None:
+        if value is None or value == "":
+            return None
+        try:
+            if isinstance(value, str):
+                value = value.strip().replace("%", "")
+            probability = float(value)
+        except (TypeError, ValueError):
+            return None
+        if probability > 1:
+            probability /= 100
+        if not 0 <= probability <= 1:
+            return None
+        return probability
+
+    @classmethod
+    def _binary_probability_from_prediction(cls, prediction: Any | None) -> float | None:
+        if prediction is None:
+            return None
+        if isinstance(prediction, (float, int)):
+            return cls._coerce_probability(prediction)
+        return cls._coerce_probability(getattr(prediction, "prediction_in_decimal", None))
+
+    @classmethod
+    def _multiple_choice_probabilities_from_prediction(
+        cls, prediction: Any | None
+    ) -> dict[str, float] | None:
+        if prediction is None:
+            return None
+        if hasattr(prediction, "to_dict"):
+            try:
+                return {
+                    str(option): float(probability)
+                    for option, probability in prediction.to_dict().items()
+                }
+            except Exception:
+                pass
+        predicted_options = getattr(prediction, "predicted_options", None)
+        if not predicted_options:
+            return None
+        probabilities: dict[str, float] = {}
+        for option in predicted_options:
+            name = getattr(option, "option_name", None)
+            probability = cls._coerce_probability(getattr(option, "probability", None))
+            if name is not None and probability is not None:
+                probabilities[str(name)] = probability
+        return probabilities or None
+
+    @staticmethod
+    def _normalise_confidence(value: Any) -> str:
+        confidence = str(value or "").strip().lower()
+        if confidence in {"low", "medium", "high"}:
+            return confidence
+        return "low"
+
+    @staticmethod
+    def _coerce_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    @classmethod
+    def _extract_json_object(cls, text: str) -> dict[str, Any]:
+        cleaned = text.strip()
+        fenced_match = re.search(
+            r"```(?:json)?\s*(.*?)\s*```",
+            cleaned,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if fenced_match:
+            cleaned = fenced_match.group(1)
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            cleaned = cleaned[start : end + 1]
+        parsed = json.loads(cleaned)
+        if not isinstance(parsed, dict):
+            raise ValueError("Scout response JSON was not an object.")
+        return parsed
+
+    @classmethod
+    def _scout_decision_from_response(
+        cls,
+        question: MetaculusQuestion,
+        previous_forecast: Any | None,
+        raw_response: str,
+    ) -> RefreshScoutDecision:
+        previous_timestamp = cls._prediction_timestamp(previous_forecast)
+        try:
+            payload = cls._extract_json_object(raw_response)
+            estimated_probabilities = payload.get("estimated_new_probabilities")
+            if isinstance(estimated_probabilities, dict):
+                estimated_probabilities = {
+                    str(option): probability
+                    for option, value in estimated_probabilities.items()
+                    if (probability := cls._coerce_probability(value)) is not None
+                }
+            else:
+                estimated_probabilities = None
+            return RefreshScoutDecision(
+                question_id=getattr(question, "id_of_question", None),
+                post_id=getattr(question, "id_of_post", None),
+                page_url=getattr(question, "page_url", None),
+                question_title=getattr(question, "question_text", ""),
+                question_type=question.get_api_type_name(),
+                previous_forecast=cls._readable_prediction(previous_forecast),
+                previous_forecast_timestamp=(
+                    previous_timestamp.isoformat() if previous_timestamp else None
+                ),
+                should_reforecast=cls._coerce_bool(
+                    payload.get("should_reforecast")
+                ),
+                recommended_action=str(
+                    payload.get("recommended_action", "skip")
+                ).strip().lower(),
+                confidence_in_movement=cls._normalise_confidence(
+                    payload.get("confidence_in_movement")
+                ),
+                movement_reason=str(payload.get("movement_reason", "")).strip(),
+                fresh_evidence_summary=str(
+                    payload.get("fresh_evidence_summary", "")
+                ).strip(),
+                estimated_new_forecast=cls._coerce_probability(
+                    payload.get("estimated_new_forecast")
+                ),
+                estimated_new_probabilities=estimated_probabilities,
+                material_distribution_shift=cls._coerce_bool(
+                    payload.get("material_distribution_shift")
+                ),
+                fresh_high_signal_evidence=cls._coerce_bool(
+                    payload.get("fresh_high_signal_evidence")
+                ),
+                prior_reasoning_stale=cls._coerce_bool(
+                    payload.get("prior_reasoning_stale")
+                ),
+                raw_response=raw_response,
+            )
+        except Exception as error:
+            logger.warning(
+                "Could not parse scout response for URL %s: %r\n%s",
+                question.page_url,
+                error,
+                raw_response,
+            )
+            return RefreshScoutDecision(
+                question_id=getattr(question, "id_of_question", None),
+                post_id=getattr(question, "id_of_post", None),
+                page_url=getattr(question, "page_url", None),
+                question_title=getattr(question, "question_text", ""),
+                question_type=question.get_api_type_name(),
+                previous_forecast=cls._readable_prediction(previous_forecast),
+                previous_forecast_timestamp=(
+                    previous_timestamp.isoformat() if previous_timestamp else None
+                ),
+                should_reforecast=False,
+                recommended_action="skip",
+                confidence_in_movement="low",
+                movement_reason="Scout response could not be parsed.",
+                fresh_evidence_summary="",
+                raw_response=raw_response,
+                parse_error=repr(error),
+            )
+
+    def _scout_llm(self) -> GeneralLlm:
+        return GeneralLlm(
+            model=os.getenv("SCOUT_MODEL", "openrouter/z-ai/glm-5.1"),
+            temperature=0.1,
+            timeout=_env_int("SCOUT_TIMEOUT_SECONDS", 180),
+            allowed_tries=2,
+            max_tokens=_env_int("SCOUT_MAX_TOKENS", 1500),
+        )
+
+    async def _run_scout_research(self, question: MetaculusQuestion) -> str:
+        researcher = os.getenv("SCOUT_RESEARCHER_MODEL", "perplexity").strip()
+        if not researcher or researcher in {"None", "no_research"}:
+            return ""
+        prompt = clean_indents(
+            f"""
+            You are doing a cheap update check for an existing Metaculus forecast.
+            Search only for fresh, resolution-relevant information since the bot's
+            previous forecast. Do not make a final forecast.
+
+            Return a compact memo with:
+            - New direct evidence, if any.
+            - Official/source-of-truth changes, if any.
+            - Market, poll, benchmark, company, legal, or government updates, if directly relevant.
+            - Whether the prior evidence base appears stale.
+            - If nothing important changed, say so clearly.
+
+            Question:
+            {question.question_text}
+
+            Background:
+            {question.background_info}
+
+            Resolution criteria:
+            {question.resolution_criteria}
+
+            Fine print:
+            {question.fine_print}
+            """
+        )
+        try:
+            research = await self._run_configured_researcher(
+                researcher, prompt, question, allow_fallback=False
+            )
+        except Exception as error:
+            logger.warning(
+                "Scout research failed for URL %s with %s: %r",
+                question.page_url,
+                researcher,
+                error,
+            )
+            return ""
+        return self._truncate_for_prompt(research, _env_int("SCOUT_RESEARCH_MAX_CHARS", 5000))
+
+    def _build_scout_prompt(
+        self,
+        question: MetaculusQuestion,
+        previous_forecast: Any | None,
+        scout_research: str,
+    ) -> str:
+        previous_timestamp = self._prediction_timestamp(previous_forecast)
+        options_text = (
+            f"Options: {question.options}"
+            if isinstance(question, MultipleChoiceQuestion)
+            else ""
+        )
+        bounds_text = ""
+        if isinstance(question, (NumericQuestion, DateQuestion)):
+            bounds_text = clean_indents(
+                f"""
+                Lower bound: {question.lower_bound}
+                Upper bound: {question.upper_bound}
+                Open lower bound: {question.open_lower_bound}
+                Open upper bound: {question.open_upper_bound}
+                Unit: {question.unit_of_measure}
+                """
+            )
+        return clean_indents(
+            f"""
+            You are a cheap scout for an autonomous Metaculus forecasting bot.
+            Your job is to decide whether it is worth spending more money on a full
+            reforecast. Do not optimize for looking active; recommend a full
+            reforecast only when the full system is likely to materially change.
+
+            Current UTC time: {datetime.now(timezone.utc).isoformat()}
+            Question type: {question.get_api_type_name()}
+            Page URL: {question.page_url}
+            Close time: {question.close_time}
+            Scheduled resolution time: {question.scheduled_resolution_time}
+
+            Question:
+            {question.question_text}
+
+            Background:
+            {question.background_info}
+
+            Resolution criteria:
+            {question.resolution_criteria}
+
+            Fine print:
+            {question.fine_print}
+
+            {options_text}
+            {bounds_text}
+
+            Bot's previous forecast:
+            {self._readable_prediction(previous_forecast)}
+
+            Previous forecast timestamp:
+            {previous_timestamp.isoformat() if previous_timestamp else "unknown"}
+
+            Fresh update research:
+            {scout_research or "No fresh research was available."}
+
+            Return exactly one JSON object and no other text.
+            Schema:
+            {{
+              "should_reforecast": true,
+              "estimated_new_forecast": 0.42,
+              "estimated_new_probabilities": {{"Option A": 0.5, "Option B": 0.5}},
+              "material_distribution_shift": false,
+              "fresh_high_signal_evidence": false,
+              "prior_reasoning_stale": false,
+              "movement_reason": "new evidence / closing soon / stale reasoning / other",
+              "confidence_in_movement": "low|medium|high",
+              "fresh_evidence_summary": "brief summary",
+              "recommended_action": "skip|full_reforecast"
+            }}
+
+            Output rules:
+            - For binary questions, set estimated_new_forecast to a decimal probability from 0 to 1.
+            - For multiple-choice questions, set estimated_new_probabilities using the exact option names.
+            - For numeric or date questions, set material_distribution_shift=true only if the median or central interval would materially move.
+            - Set fresh_high_signal_evidence=true only for direct evidence that maps to the resolution criteria.
+            - Use "high" confidence only when the evidence is direct and you expect a meaningful forecast move.
+            - Use recommended_action="full_reforecast" only if the expensive full system is likely worthwhile.
+            """
+        )
+
+    async def run_refresh_scout(
+        self, question: MetaculusQuestion
+    ) -> RefreshScoutDecision:
+        previous_forecast = self._latest_previous_forecast(question)
+        scout_research = await self._run_scout_research(question)
+        prompt = self._build_scout_prompt(question, previous_forecast, scout_research)
+        raw_response = await self._scout_llm().invoke(prompt)
+        decision = self._scout_decision_from_response(
+            question, previous_forecast, raw_response
+        )
+        decision.gate_reasons = self._refresh_gate_reasons(question, decision)
+        decision.gate_triggered = bool(decision.gate_reasons)
+        logger.info(
+            "Refresh scout for URL %s: gate=%s reasons=%s decision=%s",
+            question.page_url,
+            decision.gate_triggered,
+            decision.gate_reasons,
+            decision.recommended_action,
+        )
+        return decision
+
+    @staticmethod
+    def _hours_until_close(question: MetaculusQuestion) -> float | None:
+        close_time = getattr(question, "close_time", None)
+        if close_time is None:
+            return None
+        if close_time.tzinfo is None:
+            close_time = close_time.replace(tzinfo=timezone.utc)
+        return (close_time - datetime.now(timezone.utc)).total_seconds() / 3600
+
+    @classmethod
+    def _forecast_age_days(cls, question: MetaculusQuestion) -> float | None:
+        previous_forecast = cls._latest_previous_forecast(question)
+        timestamp = cls._prediction_timestamp(previous_forecast)
+        if timestamp is None:
+            return None
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - timestamp).total_seconds() / 86400
+
+    @classmethod
+    def _binary_log_odds_move(cls, old_probability: float, new_probability: float) -> float:
+        old_probability = cls._clamp_probability(old_probability)
+        new_probability = cls._clamp_probability(new_probability)
+        return abs(
+            math.log(new_probability / (1 - new_probability))
+            - math.log(old_probability / (1 - old_probability))
+        )
+
+    @classmethod
+    def _refresh_gate_reasons(
+        cls, question: MetaculusQuestion, decision: RefreshScoutDecision
+    ) -> list[str]:
+        reasons: list[str] = []
+        confidence = decision.confidence_in_movement
+        hours_until_close = cls._hours_until_close(question)
+        if (
+            hours_until_close is not None
+            and 0 <= hours_until_close <= _env_float("SCOUT_CLOSING_SOON_HOURS", 48)
+        ):
+            reasons.append(f"question closes soon ({hours_until_close:.1f}h)")
+
+        forecast_age_days = cls._forecast_age_days(question)
+        if (
+            forecast_age_days is not None
+            and forecast_age_days >= _env_float("SCOUT_STALE_DAYS", 7)
+        ):
+            reasons.append(f"forecast is stale ({forecast_age_days:.1f}d old)")
+
+        previous_forecast = cls._latest_previous_forecast(question)
+        if isinstance(question, BinaryQuestion):
+            old_probability = cls._binary_probability_from_prediction(previous_forecast)
+            new_probability = decision.estimated_new_forecast
+            if old_probability is not None and new_probability is not None:
+                absolute_move = abs(new_probability - old_probability)
+                if absolute_move >= _env_float("SCOUT_BINARY_ABS_MOVE", 0.08):
+                    reasons.append(f"binary probability moved {absolute_move:.1%}")
+                log_odds_move = cls._binary_log_odds_move(
+                    old_probability, new_probability
+                )
+                if log_odds_move >= _env_float("SCOUT_BINARY_LOG_ODDS_MOVE", 0.35):
+                    reasons.append(f"binary log-odds moved {log_odds_move:.2f}")
+        elif isinstance(question, MultipleChoiceQuestion):
+            old_probabilities = cls._multiple_choice_probabilities_from_prediction(
+                previous_forecast
+            )
+            new_probabilities = decision.estimated_new_probabilities
+            if old_probabilities and new_probabilities:
+                shared_options = set(old_probabilities) & set(new_probabilities)
+                if shared_options:
+                    max_move = max(
+                        abs(new_probabilities[option] - old_probabilities[option])
+                        for option in shared_options
+                    )
+                    if max_move >= _env_float("SCOUT_MC_MAX_OPTION_MOVE", 0.08):
+                        reasons.append(
+                            f"multiple-choice option probability moved {max_move:.1%}"
+                        )
+                    old_top = max(old_probabilities, key=old_probabilities.get)
+                    new_top = max(new_probabilities, key=new_probabilities.get)
+                    if old_top != new_top:
+                        reasons.append(
+                            f"multiple-choice top option changed ({old_top} -> {new_top})"
+                        )
+        elif decision.material_distribution_shift and confidence != "low":
+            reasons.append("scout expects material distribution shift")
+
+        if (
+            decision.recommended_action == "full_reforecast"
+            and decision.should_reforecast
+            and confidence == "high"
+        ):
+            reasons.append("scout high-confidence full-reforecast recommendation")
+        if decision.fresh_high_signal_evidence and confidence != "low":
+            reasons.append("fresh high-signal evidence")
+        if decision.prior_reasoning_stale and confidence != "low":
+            reasons.append("scout says prior reasoning is stale")
+        return reasons
 
     async def _run_configured_researcher(
         self,
@@ -4415,6 +4908,206 @@ class SpringTemplateBot2026(ForecastBot):
         )
 
 
+def _select_refresh_scout_questions(
+    questions: list[MetaculusQuestion],
+    *,
+    max_questions: int | None,
+    shuffle_seed: int | None,
+) -> list[MetaculusQuestion]:
+    forecasted_questions = [
+        question
+        for question in questions
+        if bool(getattr(question, "already_forecasted", False))
+    ]
+    return _select_question_batch(
+        forecasted_questions,
+        max_questions=max_questions,
+        shuffle_seed=shuffle_seed,
+    )
+
+
+def _refresh_decision_priority(decision: RefreshScoutDecision) -> tuple[int, int]:
+    reason_text = " ".join(decision.gate_reasons).lower()
+    close_priority = 0 if "closes soon" in reason_text else 1
+    confidence_priority = {"high": 0, "medium": 1, "low": 2}.get(
+        decision.confidence_in_movement, 2
+    )
+    return (close_priority, confidence_priority)
+
+
+async def _refresh_tournament_forecasts(
+    bot: SpringTemplateBot2026,
+    client: MetaculusClient,
+    target_tournament_ids: list[str | int],
+    *,
+    max_scout_questions: int | None,
+    max_full_reforecasts: int | None,
+    shuffle_seed: int | None,
+    continue_on_question_errors: bool,
+) -> tuple[list[Any], list[RefreshScoutDecision]]:
+    scout_decisions: list[RefreshScoutDecision] = []
+    questions_for_full_reforecast: list[MetaculusQuestion] = []
+    selected_question_keys: set[str] = set()
+
+    for tournament_id in target_tournament_ids:
+        questions = _get_open_tournament_questions(client, tournament_id)
+        already_forecasted_count = len(
+            [question for question in questions if getattr(question, "already_forecasted", False)]
+        )
+        scout_questions = _select_refresh_scout_questions(
+            questions,
+            max_questions=max_scout_questions,
+            shuffle_seed=shuffle_seed,
+        )
+        logger.info(
+            "Refresh scout selected %s of %s already-forecasted open questions "
+            "from tournament %s (%s open total).",
+            len(scout_questions),
+            already_forecasted_count,
+            tournament_id,
+            len(questions),
+        )
+        for question in scout_questions:
+            try:
+                decision = await bot.run_refresh_scout(question)
+            except BaseException as error:
+                logger.error(
+                    "Refresh scout failed for %s: %r",
+                    getattr(question, "page_url", ""),
+                    error,
+                )
+                previous_forecast = bot._latest_previous_forecast(question)
+                previous_timestamp = bot._prediction_timestamp(previous_forecast)
+                decision = RefreshScoutDecision(
+                    question_id=getattr(question, "id_of_question", None),
+                    post_id=getattr(question, "id_of_post", None),
+                    page_url=getattr(question, "page_url", None),
+                    question_title=getattr(question, "question_text", ""),
+                    question_type=question.get_api_type_name(),
+                    previous_forecast=bot._readable_prediction(previous_forecast),
+                    previous_forecast_timestamp=(
+                        previous_timestamp.isoformat() if previous_timestamp else None
+                    ),
+                    should_reforecast=False,
+                    recommended_action="skip",
+                    confidence_in_movement="low",
+                    movement_reason="Scout failed.",
+                    fresh_evidence_summary="",
+                    parse_error=repr(error),
+                )
+            scout_decisions.append(decision)
+            if not decision.gate_triggered:
+                continue
+            question_key_value = (
+                getattr(question, "id_of_question", None)
+                or getattr(question, "id_of_post", None)
+                or getattr(question, "page_url", "")
+            )
+            question_key = str(question_key_value)
+            if question_key in selected_question_keys:
+                continue
+            selected_question_keys.add(question_key)
+            questions_for_full_reforecast.append(question)
+
+    gated_decisions_by_url = {
+        decision.page_url: decision
+        for decision in scout_decisions
+        if decision.gate_triggered and decision.page_url
+    }
+    questions_for_full_reforecast.sort(
+        key=lambda question: _refresh_decision_priority(
+            gated_decisions_by_url.get(
+                getattr(question, "page_url", None),
+                RefreshScoutDecision(
+                    question_id=getattr(question, "id_of_question", None),
+                    post_id=getattr(question, "id_of_post", None),
+                    page_url=getattr(question, "page_url", None),
+                    question_title=getattr(question, "question_text", ""),
+                    question_type=question.get_api_type_name(),
+                    previous_forecast="",
+                    previous_forecast_timestamp=None,
+                    should_reforecast=False,
+                    recommended_action="skip",
+                    confidence_in_movement="low",
+                    movement_reason="",
+                    fresh_evidence_summary="",
+                ),
+            )
+        )
+    )
+    if max_full_reforecasts is not None and max_full_reforecasts >= 0:
+        questions_for_full_reforecast = questions_for_full_reforecast[
+            :max_full_reforecasts
+        ]
+
+    logger.info(
+        "Refresh scout selected %s questions for full reforecast.",
+        len(questions_for_full_reforecast),
+    )
+    if not questions_for_full_reforecast:
+        return [], scout_decisions
+
+    bot.skip_previously_forecasted_questions = False
+    if continue_on_question_errors:
+        forecast_reports = []
+        for index, question in enumerate(questions_for_full_reforecast, start=1):
+            logger.info(
+                "Full refresh reforecast %s/%s: %s",
+                index,
+                len(questions_for_full_reforecast),
+                getattr(question, "page_url", ""),
+            )
+            try:
+                forecast_reports.extend(
+                    await bot.forecast_questions([question], return_exceptions=True)
+                )
+            except BaseException as error:
+                forecast_reports.append(error)
+                logger.error(
+                    "Full refresh reforecast failed for %s: %r",
+                    getattr(question, "page_url", ""),
+                    error,
+                )
+                if _looks_like_credit_exhaustion(error):
+                    logger.error(
+                        "Stopping refresh reforecasts because the model provider appears to be out of credits/quota."
+                    )
+                    break
+    else:
+        forecast_reports = await bot.forecast_questions(
+            questions_for_full_reforecast, return_exceptions=True
+        )
+    return list(forecast_reports), scout_decisions
+
+
+def _write_refresh_scout_logs(
+    scout_decisions: list[RefreshScoutDecision],
+    *,
+    run_id: str,
+    log_dir: Path,
+) -> None:
+    if not scout_decisions or not _env_bool("ENABLE_EXPERIMENT_LOGGING", True):
+        return
+    run_dir = log_dir / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    records = [asdict(decision) for decision in scout_decisions]
+    (run_dir / "refresh_scout_decisions.json").write_text(
+        json.dumps(records, indent=2), encoding="utf-8"
+    )
+    lines = ["# Refresh Scout Decisions", ""]
+    for decision in scout_decisions:
+        gate = "full reforecast" if decision.gate_triggered else "skip"
+        reasons = "; ".join(decision.gate_reasons) if decision.gate_reasons else "-"
+        lines.append(
+            f"- `{decision.post_id or decision.question_id}` | {gate} | "
+            f"{decision.confidence_in_movement} | {reasons} | "
+            f"{decision.question_title}"
+        )
+    (run_dir / "refresh_scout_decisions.md").write_text(
+        "\n".join(lines) + "\n", encoding="utf-8"
+    )
+
+
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
@@ -4440,6 +5133,7 @@ if __name__ == "__main__":
         choices=[
             "tournament",
             "repredict_tournament",
+            "refresh_tournament",
             "minibench",
             "benchmarking_questions",
             "metaculus_cup",
@@ -4493,6 +5187,26 @@ if __name__ == "__main__":
         help="Forecast selected tournament questions one at a time and keep going after per-question failures.",
     )
     parser.add_argument(
+        "--max-scout-questions",
+        type=int,
+        default=(
+            int(os.getenv("MAX_SCOUT_QUESTIONS"))
+            if os.getenv("MAX_SCOUT_QUESTIONS", "").strip().isdigit()
+            else None
+        ),
+        help="Refresh mode only: maximum already-forecasted open questions to scout. Defaults to all.",
+    )
+    parser.add_argument(
+        "--max-full-reforecasts",
+        type=int,
+        default=(
+            int(os.getenv("MAX_FULL_REFORECASTS"))
+            if os.getenv("MAX_FULL_REFORECASTS", "").strip().isdigit()
+            else 5
+        ),
+        help="Refresh mode only: cap full reforecasts triggered by scout gates. Defaults to 5.",
+    )
+    parser.add_argument(
         "--experiment-mode",
         choices=["off", "random", "variant"],
         default=default_experiment_mode,
@@ -4534,6 +5248,7 @@ if __name__ == "__main__":
     run_mode: Literal[
         "tournament",
         "repredict_tournament",
+        "refresh_tournament",
         "minibench",
         "benchmarking_questions",
         "metaculus_cup",
@@ -4543,6 +5258,7 @@ if __name__ == "__main__":
     assert run_mode in [
         "tournament",
         "repredict_tournament",
+        "refresh_tournament",
         "minibench",
         "benchmarking_questions",
         "metaculus_cup",
@@ -4616,6 +5332,7 @@ if __name__ == "__main__":
     default_tournament_ids_by_mode: dict[str, list[str | int]] = {
         "tournament": ["summer-futureeval-2026"],
         "repredict_tournament": ["summer-futureeval-2026"],
+        "refresh_tournament": ["summer-futureeval-2026"],
         "minibench": [client.CURRENT_MINIBENCH_ID],
         "benchmarking_questions": ["bot-benchmarking-question-list"],
     }
@@ -4625,6 +5342,7 @@ if __name__ == "__main__":
         else args.tournament_id
         or default_tournament_ids_by_mode.get(run_mode, ["summer-futureeval-2026"])
     )
+    refresh_scout_decisions: list[RefreshScoutDecision] = []
     if run_mode in ["tournament", "minibench", "benchmarking_questions"]:
         forecast_reports = []
         for tournament_id in target_tournament_ids:
@@ -4684,6 +5402,18 @@ if __name__ == "__main__":
                     )
                 )
             )
+    elif run_mode == "refresh_tournament":
+        forecast_reports, refresh_scout_decisions = asyncio.run(
+            _refresh_tournament_forecasts(
+                template_bot,
+                client,
+                target_tournament_ids,
+                max_scout_questions=args.max_scout_questions,
+                max_full_reforecasts=args.max_full_reforecasts,
+                shuffle_seed=args.question_shuffle_seed,
+                continue_on_question_errors=args.continue_on_question_errors,
+            )
+        )
     elif run_mode == "metaculus_cup":
         # The Metaculus cup is a good way to test the bot's performance on regularly open questions. You can also use AXC_2025_TOURNAMENT_ID = 32564 or AI_2027_TOURNAMENT_ID = "ai-2027"
         # The Metaculus cup may not be initialized near the beginning of a season (i.e. January, May, September)
@@ -4738,6 +5468,11 @@ if __name__ == "__main__":
         selected_variant=selected_variant,
         experiment_seed=experiment_seed,
         publish_reports=publish_reports,
+    )
+    _write_refresh_scout_logs(
+        refresh_scout_decisions,
+        run_id=run_id,
+        log_dir=Path(args.experiment_log_dir),
     )
     if summary_error is not None:
         successful_reports = [

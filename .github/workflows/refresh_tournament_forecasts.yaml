@@ -1,0 +1,137 @@
+name: Refresh existing AI tournament forecasts
+
+on:
+  workflow_dispatch:
+    inputs:
+      tournament_ids:
+        description: "Comma-separated tournament slugs/IDs to refresh"
+        required: true
+        default: "summer-futureeval-2026"
+      max_full_reforecasts:
+        description: "Maximum full reforecasts after scout gates"
+        required: false
+        default: "5"
+      practice:
+        description: "Run full reforecasts without publishing to Metaculus"
+        required: true
+        default: false
+        type: boolean
+  schedule:
+    - cron: "37 2 * * *" # Daily refresh pass, offset from round-hour GitHub cron congestion.
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  refresh_forecasts_job:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check tournament window
+        id: tournament_window
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            now="$(date -u +%s)"
+            tournament_start="$(date -u -d '2026-05-18 00:00:00 UTC' +%s)"
+            if [ "$now" -lt "$tournament_start" ]; then
+              echo "Scheduled refresh skipped before Summer FutureEval starts."
+              echo "should_run=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "should_run=true" >> "$GITHUB_OUTPUT"
+      - name: Check out repository
+        if: steps.tournament_window.outputs.should_run == 'true'
+        uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        if: steps.tournament_window.outputs.should_run == 'true'
+        with:
+          python-version: "3.11"
+      - name: Check OpenRouter key budget
+        if: steps.tournament_window.outputs.should_run == 'true'
+        run: python scripts/check_openrouter_budget.py
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_BOT_TOKEN || secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_MIN_CREDITS_REMAINING: "0.05"
+      - name: Install poetry
+        if: steps.tournament_window.outputs.should_run == 'true'
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          installer-parallel: true
+      - name: Install dependencies
+        if: steps.tournament_window.outputs.should_run == 'true'
+        run: poetry install --no-interaction --no-root
+      - name: Run refresh scout and gated reforecasts
+        if: steps.tournament_window.outputs.should_run == 'true'
+        run: |
+          RUN_ARGS=(--mode refresh_tournament --continue-on-question-errors)
+          if [ "$PRACTICE_MODE" = "true" ]; then
+            RUN_ARGS+=(--practice)
+          fi
+          IFS=',' read -ra IDS <<< "$TOURNAMENT_IDS"
+          for id in "${IDS[@]}"; do
+            trimmed="$(echo "$id" | xargs)"
+            if [ -n "$trimmed" ]; then
+              RUN_ARGS+=(--tournament-id "$trimmed")
+            fi
+          done
+          if [ -n "$MAX_FULL_REFORECASTS" ]; then
+            RUN_ARGS+=(--max-full-reforecasts "$MAX_FULL_REFORECASTS")
+          fi
+          poetry run python main.py "${RUN_ARGS[@]}"
+        env:
+          TOURNAMENT_IDS: ${{ github.event.inputs.tournament_ids || 'summer-futureeval-2026' }}
+          MAX_FULL_REFORECASTS: ${{ github.event.inputs.max_full_reforecasts || '5' }}
+          PRACTICE_MODE: ${{ github.event.inputs.practice || 'false' }}
+          METACULUS_TOKEN: ${{ secrets.METACULUS_BOT_TOKEN || secrets.METACULUS_TOKEN }}
+          PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
+          EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_BOT_TOKEN || secrets.OPENROUTER_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
+          ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          EXPERIMENT_MODE: "off"
+          ENABLE_EXPERIMENT_VARIANTS: "false"
+          ALLOW_PUBLISH_EXPERIMENTS: "false"
+          ENABLE_EXPERIMENT_LOGGING: "true"
+          EXPERIMENT_LOG_DIR: "experiment_logs"
+          SCOUT_MODEL: "openrouter/z-ai/glm-5.1"
+          SCOUT_RESEARCHER_MODEL: "perplexity"
+          SCOUT_BINARY_ABS_MOVE: "0.08"
+          SCOUT_BINARY_LOG_ODDS_MOVE: "0.35"
+          SCOUT_MC_MAX_OPTION_MOVE: "0.08"
+          SCOUT_CLOSING_SOON_HOURS: "48"
+          SCOUT_STALE_DAYS: "7"
+          SCOUT_MAX_TOKENS: "1500"
+          SCOUT_RESEARCH_MAX_CHARS: "5000"
+      - name: Publish refresh status
+        if: always() && steps.tournament_window.outputs.should_run == 'true'
+        run: |
+          echo "## Refresh forecast status" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if compgen -G "experiment_logs/*/run_summary.md" > /dev/null; then
+            for summary in experiment_logs/*/run_summary.md; do
+              cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+            done
+          fi
+
+          if compgen -G "experiment_logs/*/refresh_scout_decisions.md" > /dev/null; then
+            for summary in experiment_logs/*/refresh_scout_decisions.md; do
+              cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+            done
+          fi
+      - name: Upload refresh forecast logs
+        if: always() && steps.tournament_window.outputs.should_run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: refresh-forecast-logs-${{ github.run_id }}
+          path: experiment_logs/
+          if-no-files-found: ignore
