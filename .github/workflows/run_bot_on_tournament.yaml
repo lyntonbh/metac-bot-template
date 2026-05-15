@@ -126,6 +126,10 @@ jobs:
           ALLOW_PUBLISH_EXPERIMENTS: "false"
           ENABLE_EXPERIMENT_LOGGING: "true"
           EXPERIMENT_LOG_DIR: "experiment_logs"
+          RESEARCHER_MODEL: "all"
+          RESEARCHER_RANDOM_MODELS: "asknews/news-summaries,perplexity,exa"
+          RESEARCHER_FALLBACK_MODEL: "exa"
+          ENABLE_SUPPLEMENTAL_WEB_RESEARCH: "true"
       - name: Upload forecast logs
         if: always() && steps.tournament_window.outputs.should_run == 'true'
         uses: actions/upload-artifact@v4

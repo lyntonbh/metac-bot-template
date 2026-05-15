@@ -1696,13 +1696,17 @@ class SpringTemplateBot2026(ForecastBot):
         return True
 
     @classmethod
-    def _select_random_researcher(cls, question: MetaculusQuestion) -> str:
-        candidates = cls._random_researcher_candidates()
-        available_candidates = [
+    def _available_researcher_candidates(cls) -> list[str]:
+        return [
             candidate
-            for candidate in candidates
+            for candidate in cls._random_researcher_candidates()
             if cls._researcher_candidate_is_available(candidate)
         ]
+
+    @classmethod
+    def _select_random_researcher(cls, question: MetaculusQuestion) -> str:
+        candidates = cls._random_researcher_candidates()
+        available_candidates = cls._available_researcher_candidates()
         if not available_candidates:
             logger.warning(
                 "No configured random researcher candidates have the needed API keys; using full candidate list."
@@ -2693,6 +2697,59 @@ class SpringTemplateBot2026(ForecastBot):
         if isinstance(researcher, GeneralLlm):
             return await researcher.invoke(prompt)
         researcher = researcher.strip()
+        if researcher in {"all", "all-available", "all-researchers"}:
+            selected_researchers = self._available_researcher_candidates()
+            if not selected_researchers:
+                logger.warning(
+                    "No all-researcher candidates have the needed API keys for %s.",
+                    question.page_url,
+                )
+                if allow_fallback:
+                    return await self._run_fallback_researcher(
+                        prompt, question, "No all-researcher candidates are available"
+                    )
+                return ""
+
+            logger.info(
+                "Running all configured researchers for %s: %s",
+                question.page_url,
+                selected_researchers,
+            )
+
+            async def run_one(candidate: str) -> str:
+                try:
+                    result = await self._run_configured_researcher(
+                        candidate, prompt, question, allow_fallback=False
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Configured researcher %s failed for %s: %r",
+                        candidate,
+                        question.page_url,
+                        exc,
+                    )
+                    return ""
+                if not result.strip():
+                    return ""
+                return f"### {candidate}\n{result}"
+
+            results = await asyncio.gather(
+                *(run_one(candidate) for candidate in selected_researchers)
+            )
+            sections = [result for result in results if result.strip()]
+            if sections:
+                return "\n\n".join(
+                    [
+                        "Ran all available configured researchers: "
+                        + ", ".join(selected_researchers),
+                        *sections,
+                    ]
+                )
+            if allow_fallback:
+                return await self._run_fallback_researcher(
+                    prompt, question, "All configured researchers returned no content"
+                )
+            return ""
         if researcher in {"random", "random-researcher", "researcher-random"}:
             selected_researcher = self._select_random_researcher(question)
             logger.info(
