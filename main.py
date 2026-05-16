@@ -4994,8 +4994,7 @@ def _refresh_decision_priority(decision: RefreshScoutDecision) -> tuple[int, int
 
 async def _refresh_tournament_forecasts(
     bot: SpringTemplateBot2026,
-    client: MetaculusClient,
-    target_tournament_ids: list[str | int],
+    tournament_questions: dict[str | int, list[MetaculusQuestion]],
     *,
     max_scout_questions: int | None,
     max_full_reforecasts: int | None,
@@ -5006,8 +5005,7 @@ async def _refresh_tournament_forecasts(
     questions_for_full_reforecast: list[MetaculusQuestion] = []
     selected_question_keys: set[str] = set()
 
-    for tournament_id in target_tournament_ids:
-        questions = _get_open_tournament_questions(client, tournament_id)
+    for tournament_id, questions in tournament_questions.items():
         already_forecasted_count = len(
             [question for question in questions if getattr(question, "already_forecasted", False)]
         )
@@ -5440,11 +5438,10 @@ if __name__ == "__main__":
                         )
                     )
             else:
+                questions = _get_open_tournament_questions(client, tournament_id)
                 forecast_reports.extend(
                     asyncio.run(
-                        template_bot.forecast_on_tournament(
-                            tournament_id, return_exceptions=True
-                        )
+                        template_bot.forecast_questions(questions, return_exceptions=True)
                     )
                 )
     elif run_mode == "repredict_tournament":
@@ -5452,19 +5449,20 @@ if __name__ == "__main__":
         template_bot.skip_previously_forecasted_questions = False
         forecast_reports = []
         for tournament_id in target_tournament_ids:
+            questions = _get_open_tournament_questions(client, tournament_id)
             forecast_reports.extend(
                 asyncio.run(
-                    template_bot.forecast_on_tournament(
-                        tournament_id, return_exceptions=True
-                    )
+                    template_bot.forecast_questions(questions, return_exceptions=True)
                 )
             )
     elif run_mode == "refresh_tournament":
+        prefetched_tournament_questions: dict[str | int, list[MetaculusQuestion]] = {
+            tid: _get_open_tournament_questions(client, tid) for tid in target_tournament_ids
+        }
         forecast_reports, refresh_scout_decisions = asyncio.run(
             _refresh_tournament_forecasts(
                 template_bot,
-                client,
-                target_tournament_ids,
+                prefetched_tournament_questions,
                 max_scout_questions=args.max_scout_questions,
                 max_full_reforecasts=args.max_full_reforecasts,
                 shuffle_seed=args.question_shuffle_seed,
@@ -5475,10 +5473,9 @@ if __name__ == "__main__":
         # The Metaculus cup is a good way to test the bot's performance on regularly open questions. You can also use AXC_2025_TOURNAMENT_ID = 32564 or AI_2027_TOURNAMENT_ID = "ai-2027"
         # The Metaculus cup may not be initialized near the beginning of a season (i.e. January, May, September)
         template_bot.skip_previously_forecasted_questions = False
+        questions = _get_open_tournament_questions(client, client.CURRENT_METACULUS_CUP_ID)
         forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_METACULUS_CUP_ID, return_exceptions=True
-            )
+            template_bot.forecast_questions(questions, return_exceptions=True)
         )
     elif run_mode == "question_urls":
         if not manual_question_urls:
