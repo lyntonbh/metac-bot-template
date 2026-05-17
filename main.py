@@ -586,6 +586,13 @@ def _get_open_tournament_questions(
         return list(method(tournament_id=tournament_id))
     except TypeError:
         return list(method(tournament_id))
+    except requests.exceptions.HTTPError as exc:
+        logger.warning(
+            "Could not fetch questions from tournament %r: %s — treating as empty.",
+            tournament_id,
+            exc,
+        )
+        return []
 
 
 def _select_question_batch(
