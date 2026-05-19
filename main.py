@@ -50,6 +50,95 @@ from forecasting_tools import (
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
+SUMMER_FUTUREEVAL_2026_TOURNAMENT_SLUG = "summer-futureeval-2026"
+SUMMER_FUTUREEVAL_2026_TOURNAMENT_ID = 33022
+
+
+class TournamentPublicCommentMetaculusClient(MetaculusClient):
+    def __init__(
+        self,
+        *,
+        public_comment_tournaments: set[str | int] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self._public_comment_tournament_keys = {
+            str(tournament)
+            for tournament in (
+                public_comment_tournaments
+                or {
+                    SUMMER_FUTUREEVAL_2026_TOURNAMENT_SLUG,
+                    SUMMER_FUTUREEVAL_2026_TOURNAMENT_ID,
+                }
+            )
+        }
+        self._public_comment_post_cache: dict[int, bool] = {}
+
+    def post_question_comment(
+        self,
+        post_id: int,
+        comment_text: str,
+        is_private: bool = True,
+        included_forecast: bool = True,
+    ) -> None:
+        if self._should_post_public_comment(post_id):
+            logger.info(
+                "Posting public comment on post %s because it belongs to a "
+                "public-comment tournament.",
+                post_id,
+            )
+            is_private = False
+        super().post_question_comment(
+            post_id,
+            comment_text,
+            is_private=is_private,
+            included_forecast=included_forecast,
+        )
+
+    def _should_post_public_comment(self, post_id: int) -> bool:
+        if post_id not in self._public_comment_post_cache:
+            self._public_comment_post_cache[post_id] = (
+                self._post_matches_public_comment_tournament(post_id)
+            )
+        return self._public_comment_post_cache[post_id]
+
+    def _post_matches_public_comment_tournament(self, post_id: int) -> bool:
+        try:
+            question_or_questions = self.get_question_by_post_id(
+                post_id, group_question_mode="unpack_subquestions"
+            )
+        except Exception as error:
+            logger.warning(
+                "Could not verify tournament membership for post %s before "
+                "deciding comment visibility; keeping comment private: %r",
+                post_id,
+                error,
+            )
+            return False
+
+        questions = (
+            question_or_questions
+            if isinstance(question_or_questions, list)
+            else [question_or_questions]
+        )
+        tournament_keys: set[str] = set()
+        for question in questions:
+            tournament_keys.update(str(slug) for slug in question.tournament_slugs)
+            projects = question.api_json.get("projects", {})
+            for project_type in ("tournament", "question_series"):
+                project_values = projects.get(project_type, [])
+                if isinstance(project_values, dict):
+                    project_values = [project_values]
+                for project in project_values:
+                    if not isinstance(project, dict):
+                        continue
+                    if project.get("slug") is not None:
+                        tournament_keys.add(str(project["slug"]))
+                    if project.get("id") is not None:
+                        tournament_keys.add(str(project["id"]))
+
+        return bool(tournament_keys & self._public_comment_tournament_keys)
+
 
 @dataclass
 class EvidenceItem:
@@ -5342,6 +5431,7 @@ if __name__ == "__main__":
         publish_reports = False
     _log_startup_key_status()
 
+    client = TournamentPublicCommentMetaculusClient()
     template_bot = SpringTemplateBot2026(
         research_reports_per_question=1,
         predictions_per_research_report=1,
@@ -5377,9 +5467,9 @@ if __name__ == "__main__":
             ),
             "researcher": os.getenv("RESEARCHER_MODEL", "random"),
         },
+        metaculus_client=client,
     )
 
-    client = MetaculusClient()
     manual_question_urls = _dedupe_preserving_order(
         _split_csv_args(
             (args.question_url or [])
