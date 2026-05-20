@@ -5467,8 +5467,8 @@ if __name__ == "__main__":
             ),
             "researcher": os.getenv("RESEARCHER_MODEL", "random"),
         },
-        metaculus_client=client,
     )
+    template_bot.metaculus_client = client
 
     manual_question_urls = _dedupe_preserving_order(
         _split_csv_args(
