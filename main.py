@@ -21,6 +21,7 @@ dotenv.load_dotenv()
 import requests
 
 from forecasting_tools import (
+    ApiFilter,
     AskNewsSearcher,
     BinaryQuestion,
     ForecastBot,
@@ -665,16 +666,19 @@ def _write_experiment_logs(
 def _get_open_tournament_questions(
     client: MetaculusClient, tournament_id: str | int
 ) -> list[MetaculusQuestion]:
-    method = getattr(client, "get_all_open_questions_from_tournament", None)
-    if method is None:
-        raise AttributeError(
-            "MetaculusClient does not expose get_all_open_questions_from_tournament; "
-            "omit --max-questions to use ForecastBot.forecast_on_tournament directly."
-        )
-    try:
-        return list(method(tournament_id=tournament_id))
-    except TypeError:
-        return list(method(tournament_id))
+    import asyncio
+
+    logger.info(f"Retrieving open and upcoming questions from tournament {tournament_id}")
+    api_filter = ApiFilter(
+        allowed_tournaments=[tournament_id],
+        allowed_statuses=["open", "upcoming"],
+        group_question_mode="unpack_subquestions",
+    )
+    questions = asyncio.run(client.get_questions_matching_filter(api_filter))
+    logger.info(
+        f"Retrieved {len(questions)} questions (open + upcoming) from tournament {tournament_id}"
+    )
+    return list(questions)
 
 
 def _select_question_batch(
