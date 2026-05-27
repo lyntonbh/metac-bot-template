@@ -3127,7 +3127,7 @@ class SpringTemplateBot2026(ForecastBot):
         self, question: MetaculusQuestion
     ) -> list[EvidenceItem]:
         base_url = os.getenv(
-            "KALSHI_API_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2"
+            "KALSHI_API_BASE_URL", "https://api.kalshi.com/trade-api/v2"
         ).rstrip("/")
         markets_by_key: dict[str, dict[str, Any]] = {}
         params_to_try = [{"status": "open", "limit": 1000}]
