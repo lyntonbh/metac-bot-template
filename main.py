@@ -5497,47 +5497,38 @@ if __name__ == "__main__":
     if run_mode in ["tournament", "minibench", "benchmarking_questions"]:
         forecast_reports = []
         for tournament_id in target_tournament_ids:
-            if args.max_questions is not None:
-                questions = _get_open_tournament_questions(client, tournament_id)
-                eligible_questions = (
-                    _filter_previously_forecasted_questions(questions)
-                    if template_bot.skip_previously_forecasted_questions
-                    else questions
-                )
-                selected_questions = _select_question_batch(
-                    eligible_questions,
-                    max_questions=args.max_questions,
-                    shuffle_seed=args.question_shuffle_seed,
-                )
-                logger.info(
-                    "Selected %s of %s eligible open questions from tournament %s "
-                    "(%s open total, max_questions=%s, shuffle_seed=%s)",
-                    len(selected_questions),
-                    len(eligible_questions),
-                    tournament_id,
-                    len(questions),
-                    args.max_questions,
-                    args.question_shuffle_seed,
-                )
-                if args.continue_on_question_errors:
-                    forecast_reports.extend(
-                        _forecast_questions_resiliently(
-                            template_bot, selected_questions
-                        )
+            questions = _get_open_tournament_questions(client, tournament_id)
+            eligible_questions = (
+                _filter_previously_forecasted_questions(questions)
+                if template_bot.skip_previously_forecasted_questions
+                else questions
+            )
+            selected_questions = _select_question_batch(
+                eligible_questions,
+                max_questions=args.max_questions,
+                shuffle_seed=args.question_shuffle_seed,
+            )
+            logger.info(
+                "Selected %s of %s eligible questions from tournament %s "
+                "(%s open+upcoming total, max_questions=%s, shuffle_seed=%s)",
+                len(selected_questions),
+                len(eligible_questions),
+                tournament_id,
+                len(questions),
+                args.max_questions,
+                args.question_shuffle_seed,
+            )
+            if args.continue_on_question_errors:
+                forecast_reports.extend(
+                    _forecast_questions_resiliently(
+                        template_bot, selected_questions
                     )
-                else:
-                    forecast_reports.extend(
-                        asyncio.run(
-                            template_bot.forecast_questions(
-                                selected_questions, return_exceptions=True
-                            )
-                        )
-                    )
+                )
             else:
                 forecast_reports.extend(
                     asyncio.run(
-                        template_bot.forecast_on_tournament(
-                            tournament_id, return_exceptions=True
+                        template_bot.forecast_questions(
+                            selected_questions, return_exceptions=True
                         )
                     )
                 )
