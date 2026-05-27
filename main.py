@@ -473,6 +473,9 @@ def _report_log_record(report: Any) -> dict[str, Any]:
         "prediction": _json_safe(getattr(report, "prediction", None)),
         "explanation": _json_safe(getattr(report, "explanation", "")),
         "research": _json_safe(getattr(report, "research", "")),
+        "cost_estimate": _json_safe(getattr(report, "price_estimate", None)),
+        "time_spent_in_minutes": _json_safe(getattr(report, "time_spent_in_minutes", None)),
+        "llms": _json_safe(getattr(report, "llms", None)),
     }
 
 
@@ -5443,7 +5446,7 @@ if __name__ == "__main__":
         publish_reports_to_metaculus=publish_reports,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
-        extra_metadata_in_explanation=True,
+        extra_metadata_in_explanation=False,
         llms={
             "default": GeneralLlm(
                 model=os.getenv(
