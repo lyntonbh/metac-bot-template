@@ -1007,7 +1007,22 @@ class SpringTemplateBot2026(ForecastBot):
             "treaty texts, sanctions lists, ACLED/ISW-style conflict trackers, and major wire services"
         ),
     }
-    _market_providers = {"kalshi", "polymarket", "manifold"}
+    _market_providers = {"kalshi", "polymarket", "manifold", "odds_api"}
+    _odds_api_sport_key_phrases: list[tuple[list[str], str]] = [
+        (["nfl", "super bowl", "quarterback", "nfc championship", "afc championship"], "americanfootball_nfl"),
+        (["nba", "nba finals", "basketball championship"], "basketball_nba"),
+        (["mlb", "world series", "baseball championship"], "baseball_mlb"),
+        (["nhl", "stanley cup"], "icehockey_nhl"),
+        (["ufc", "mma", "mixed martial arts"], "mma_mixed_martial_arts"),
+        (["boxing", "world boxing"], "boxing_boxing"),
+        (["wimbledon", "us open tennis", "french open", "australian open", "atp finals", "wta finals", "grand slam tennis"], "tennis_atp_wimbledon"),
+        (["premier league", "fa cup", "epl"], "soccer_epl"),
+        (["champions league", "europa league"], "soccer_uefa_champs_league"),
+        (["pga championship", "masters golf", "us open golf", "open championship golf"], "golf_pga_championship"),
+        (["formula 1", "formula one", "f1 championship", "grand prix winner"], "motorsport_formula_1"),
+        (["cricket world cup", "ashes", "test cricket", "odi cricket"], "cricket_icc_cricket_world_cup"),
+        (["afl", "aussie rules", "australian football league"], "aussierules_afl"),
+    ]
     _country_alias_terms: dict[str, tuple[str, ...]] = {
         "argentina": ("argentina", "argentine", "argentinian"),
         "australia": ("australia", "australian"),
@@ -3000,6 +3015,13 @@ class SpringTemplateBot2026(ForecastBot):
                     ),
                 ]
             )
+            if os.getenv("ODDS_API_KEY") and self._odds_api_sport_keys_for_question(question):
+                provider_tasks.append(
+                    (
+                        "The Odds API",
+                        asyncio.create_task(self._fetch_cached_odds_api_markets(question)),
+                    )
+                )
         if "economic" in topics and os.getenv("FRED_API_KEY"):
             provider_tasks.append(
                 ("FRED", asyncio.create_task(self._fetch_cached_fred_series(question)))
@@ -3507,6 +3529,131 @@ class SpringTemplateBot2026(ForecastBot):
                     },
                 )
             )
+        return evidence_items[: self._direct_evidence_max_items_per_provider]
+
+    @classmethod
+    def _odds_api_sport_keys_for_question(cls, question: MetaculusQuestion) -> list[str]:
+        blob = cls._question_text_blob(question)
+        matched: list[str] = []
+        seen: set[str] = set()
+        for phrases, sport_key in cls._odds_api_sport_key_phrases:
+            if sport_key in seen:
+                continue
+            if any(phrase in blob for phrase in phrases):
+                matched.append(sport_key)
+                seen.add(sport_key)
+        return matched
+
+    async def _fetch_cached_odds_api_markets(
+        self, question: MetaculusQuestion
+    ) -> list[EvidenceItem]:
+        return await self._cached_evidence_fetch(
+            "odds_api", question, lambda: self._fetch_odds_api_markets(question)
+        )
+
+    async def _fetch_odds_api_markets(
+        self, question: MetaculusQuestion
+    ) -> list[EvidenceItem]:
+        api_key = os.getenv("ODDS_API_KEY", "").strip()
+        if not api_key:
+            return []
+        sport_keys = self._odds_api_sport_keys_for_question(question)
+        if not sport_keys:
+            return []
+        base_url = os.getenv("ODDS_API_BASE_URL", "https://api.the-odds-api.com/v4").rstrip("/")
+        evidence_items: list[EvidenceItem] = []
+        for sport_key in sport_keys[:2]:
+            try:
+                payload = await self._http_get_json(
+                    f"{base_url}/sports/{sport_key}/odds",
+                    params={
+                        "apiKey": api_key,
+                        "regions": "us,uk",
+                        "markets": "h2h",
+                        "oddsFormat": "decimal",
+                    },
+                    timeout=20,
+                )
+            except Exception as error:
+                logger.warning("Odds API fetch failed for %s: %r", sport_key, error)
+                continue
+            if not isinstance(payload, list):
+                continue
+            for event in payload:
+                if not isinstance(event, dict):
+                    continue
+                home_team = str(event.get("home_team") or "")
+                away_team = str(event.get("away_team") or "")
+                sport_title = str(event.get("sport_title") or "")
+                candidate_text = f"{home_team} {away_team} {sport_title}"
+                score = self._relevance_score(candidate_text, question)
+                if score < 0.06:
+                    continue
+                bookmakers = event.get("bookmakers") or []
+                if not bookmakers:
+                    continue
+                outcomes_sum: dict[str, float] = {}
+                outcomes_count: dict[str, int] = {}
+                for bookmaker in bookmakers:
+                    for market in bookmaker.get("markets") or []:
+                        if market.get("key") != "h2h":
+                            continue
+                        for outcome in market.get("outcomes") or []:
+                            name = str(outcome.get("name") or "")
+                            price = outcome.get("price")
+                            if name and price and float(price) > 1:
+                                outcomes_sum[name] = outcomes_sum.get(name, 0.0) + float(price)
+                                outcomes_count[name] = outcomes_count.get(name, 0) + 1
+                if not outcomes_sum:
+                    continue
+                avg_odds = {
+                    name: outcomes_sum[name] / outcomes_count[name]
+                    for name in outcomes_sum
+                }
+                raw_probs = {name: 1.0 / odds for name, odds in avg_odds.items()}
+                total = sum(raw_probs.values())
+                norm_probs = {name: p / total for name, p in raw_probs.items()}
+                best_outcome: str | None = max(
+                    norm_probs,
+                    key=lambda name: self._relevance_score(name, question),
+                    default=None,
+                )
+                probability = norm_probs.get(best_outcome) if best_outcome else None
+                outcome_lines = ", ".join(
+                    f"{name}: {prob:.1%}"
+                    for name, prob in sorted(norm_probs.items(), key=lambda x: -x[1])
+                )
+                evidence_items.append(
+                    EvidenceItem(
+                        source="The Odds API",
+                        provider="odds_api",
+                        title=f"{home_team} vs {away_team} ({sport_title})",
+                        url="https://the-odds-api.com",
+                        retrieved_at=datetime.now(timezone.utc).isoformat(),
+                        summary=(
+                            f"Bookmaker consensus ({len(bookmakers)} books) for "
+                            f"{home_team} vs {away_team}. "
+                            f"Implied probabilities: {outcome_lines}."
+                        ),
+                        probability=probability,
+                        date=str(event.get("commence_time") or ""),
+                        directness=self._directness_from_score(score),
+                        caveats=(
+                            "Betting odds include bookmaker margin; probabilities are "
+                            "normalized across outcomes but may still reflect market bias."
+                        ),
+                        raw={
+                            "event_id": str(event.get("id") or ""),
+                            "home_team": home_team,
+                            "away_team": away_team,
+                            "sport_key": sport_key,
+                            "sport_title": sport_title,
+                            "commence_time": str(event.get("commence_time") or ""),
+                            "implied_probabilities": norm_probs,
+                            "bookmaker_count": len(bookmakers),
+                        },
+                    )
+                )
         return evidence_items[: self._direct_evidence_max_items_per_provider]
 
     @classmethod
