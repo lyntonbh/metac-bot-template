@@ -1004,7 +1004,7 @@ class SpringTemplateBot2026(ForecastBot):
             "treaty texts, sanctions lists, ACLED/ISW-style conflict trackers, and major wire services"
         ),
     }
-    _market_providers = {"kalshi", "polymarket", "manifold"}
+    _market_providers = {"kalshi", "polymarket", "manifold", "betfair", "odds_api"}
     _country_alias_terms: dict[str, tuple[str, ...]] = {
         "argentina": ("argentina", "argentine", "argentinian"),
         "australia": ("australia", "australian"),
@@ -1917,6 +1917,12 @@ class SpringTemplateBot2026(ForecastBot):
         response.raise_for_status()
         return response.json()
 
+    @staticmethod
+    def _safe_json_post(url: str, **kwargs: Any) -> dict[str, Any] | list[Any]:
+        response = requests.post(url, timeout=kwargs.pop("timeout", 20), **kwargs)
+        response.raise_for_status()
+        return response.json()
+
     @classmethod
     async def _http_get_json(
         cls,
@@ -1934,12 +1940,56 @@ class SpringTemplateBot2026(ForecastBot):
         )
 
     @classmethod
+    async def _http_post_json(
+        cls,
+        url: str,
+        json_body: Any = None,
+        headers: dict[str, str] | None = None,
+        timeout: int = 20,
+    ) -> dict[str, Any] | list[Any]:
+        return await asyncio.to_thread(
+            cls._safe_json_post,
+            url,
+            json=json_body,
+            headers=headers,
+            timeout=timeout,
+        )
+
+    @classmethod
     def _question_terms(cls, question: MetaculusQuestion) -> set[str]:
         return {
             word.lower()
             for word in cls._text_tokens(cls._question_text_blob(question))
             if len(word) > 3 and word.lower() not in cls._stop_words
         }
+
+    @classmethod
+    def _distinctive_question_terms(cls, question: MetaculusQuestion) -> set[str]:
+        """Specific named-entity tokens from the question title (e.g. a
+        constituency or person name) that strongly identify the exact event,
+        excluding generic party / country / election vocabulary. Used so a
+        market like "Makerfield by-election Winner" is recognised as relevant
+        even though it contains no party-option or country token."""
+        question_text = str(getattr(question, "question_text", ""))
+        generic: set[str] = set(cls._stop_words) | set(cls._election_market_terms)
+        generic |= {
+            "which", "what", "who", "whom", "whose", "when", "where", "why",
+            "how", "this", "that", "these", "those", "does", "did", "are",
+            "was", "were", "has", "have", "had", "party", "candidate",
+        }
+        for option_terms in cls._question_option_terms(question):
+            generic |= option_terms
+        for aliases in cls._country_alias_terms.values():
+            for alias in aliases:
+                generic |= cls._text_tokens(alias)
+        distinctive: set[str] = set()
+        for raw_word in re.findall(r"[A-Za-z][A-Za-z0-9\-]{3,}", question_text):
+            if not raw_word[0].isupper():
+                continue
+            for token in cls._text_tokens(raw_word):
+                if len(token) > 3 and token not in generic:
+                    distinctive.add(token)
+        return distinctive
 
     @classmethod
     def _relevance_score(cls, candidate_text: str, question: MetaculusQuestion) -> float:
@@ -1966,8 +2016,16 @@ class SpringTemplateBot2026(ForecastBot):
         election_term_match = bool(candidate_words & cls._election_market_terms)
 
         if cls._is_election_question(question):
+            distinctive_terms = cls._distinctive_question_terms(question)
+            distinctive_match = bool(distinctive_terms & candidate_words)
+            # A market naming the exact event (e.g. the constituency) plus an
+            # election term is direct evidence even without a party-option or
+            # country token; that pattern is what candidate-level by-election
+            # markets look like.
+            if distinctive_match and election_term_match:
+                return "direct"
             if not option_match and not (country_match and election_term_match):
-                return None
+                return "similar" if distinctive_match else None
             if option_match and (country_match or election_term_match):
                 return "direct"
             if score >= 0.12:
@@ -2997,6 +3055,22 @@ class SpringTemplateBot2026(ForecastBot):
                     ),
                 ]
             )
+        if self._betfair_enabled():
+            provider_tasks.append(
+                (
+                    "Betfair",
+                    asyncio.create_task(self._fetch_cached_betfair_markets(question)),
+                )
+            )
+        if self._odds_api_enabled():
+            provider_tasks.append(
+                (
+                    "The Odds API",
+                    asyncio.create_task(
+                        self._fetch_cached_odds_api_markets(question)
+                    ),
+                )
+            )
         if "economic" in topics and os.getenv("FRED_API_KEY"):
             provider_tasks.append(
                 ("FRED", asyncio.create_task(self._fetch_cached_fred_series(question)))
@@ -3055,6 +3129,12 @@ class SpringTemplateBot2026(ForecastBot):
                 or item.directness != "weak"
             ]
 
+        mapped_item = await self._map_candidate_markets_to_options(
+            question, evidence_items
+        )
+        if mapped_item is not None:
+            evidence_items.append(mapped_item)
+
         evidence_items = sorted(
             evidence_items,
             key=lambda item: {"direct": 0, "similar": 1, "weak": 2}.get(
@@ -3077,6 +3157,104 @@ class SpringTemplateBot2026(ForecastBot):
             ## Structured evidence synthesis
             {synthesis}
             """
+        )
+
+    async def _map_candidate_markets_to_options(
+        self, question: MetaculusQuestion, evidence_items: list[EvidenceItem]
+    ) -> EvidenceItem | None:
+        """For party-resolution multiple-choice questions, use the LLM to map
+        candidate-level market odds (e.g. Burnham 0.76 -> Labour) onto the
+        question's party options, producing one party-level implied prior as a
+        synthesized evidence item. Returns None when not applicable or on
+        failure (fails soft)."""
+        if not self._env_flag("ENABLE_MARKET_CANDIDATE_PARTY_MAPPING", True):
+            return None
+        options = [
+            str(option).strip()
+            for option in (getattr(question, "options", None) or [])
+            if str(option).strip()
+        ]
+        if len(options) < 2 or not self._is_election_question(question):
+            return None
+        option_term_sets = [
+            terms for terms in self._question_option_terms(question) if terms
+        ]
+        market_lines: list[str] = []
+        has_candidate_shaped_market = False
+        for item in evidence_items:
+            if item.provider not in self._market_providers:
+                continue
+            detail_words = self._text_tokens(f"{item.title} {item.value}")
+            already_party = any(
+                len(option_terms & detail_words) >= min(2, len(option_terms))
+                for option_terms in option_term_sets
+            )
+            if not already_party:
+                has_candidate_shaped_market = True
+            market_lines.append(
+                f"- [{item.source}] {item.title}: {item.value or item.probability}"
+            )
+        if not market_lines or not has_candidate_shaped_market:
+            return None
+        option_block = "\n".join(f"- {option}" for option in options)
+        market_block = "\n".join(market_lines)[:4000]
+        background_block = self._truncate_for_prompt(
+            str(getattr(question, "background_info", "") or ""), 1500
+        )
+        prompt = clean_indents(
+            f"""
+            You are mapping prediction-market odds onto the answer options of a
+            multiple-choice question. The market(s) may price individual
+            candidates while the question resolves by party. Use the question
+            text, the background, and the market labels to map each candidate to
+            their party.
+
+            Question:
+            {question.question_text}
+
+            Background (for candidate->party mapping clues):
+            {background_block}
+
+            Answer options (the question resolves to exactly one of these):
+            {option_block}
+
+            Market evidence (candidate/outcome -> price or implied probability):
+            {market_block}
+
+            Output a concise party-level implied probability for each answer
+            option, one per line as "Option: NN%". Then add one sentence on the
+            candidate->party mapping you used and any caveats (liquidity,
+            non-exhaustive candidate list, normalisation). Do NOT produce a final
+            forecast; only translate the market into option-level priors.
+            """
+        )
+        try:
+            mapped_text = await self.get_llm("default", "llm").invoke(prompt)
+        except Exception as error:
+            logger.warning(
+                "Candidate->party market mapping failed for URL %s: %r",
+                question.page_url,
+                error,
+            )
+            return None
+        if not mapped_text or not mapped_text.strip():
+            return None
+        return EvidenceItem(
+            source="Market candidate->party mapping",
+            provider="polymarket",
+            title="Candidate-level market odds mapped to party options",
+            url="",
+            retrieved_at=datetime.now(timezone.utc).isoformat(),
+            summary=(
+                "LLM mapping of candidate-level prediction-market odds onto the "
+                "question's party options."
+            ),
+            value=self._truncate_for_prompt(mapped_text.strip(), 1500),
+            directness="direct",
+            caveats=(
+                "Derived mapping; verify the candidate->party assignment and "
+                "whether the listed candidates are exhaustive."
+            ),
         )
 
     async def _synthesize_direct_evidence(
@@ -3307,10 +3485,25 @@ class SpringTemplateBot2026(ForecastBot):
             "POLYMARKET_GAMMA_EVENTS_URL",
             f"{gamma_url.rstrip('/').rsplit('/markets', 1)[0]}/events",
         )
+        public_search_url = os.getenv(
+            "POLYMARKET_PUBLIC_SEARCH_URL",
+            f"{gamma_url.rstrip('/').rsplit('/markets', 1)[0]}/public-search",
+        )
         markets_by_key: dict[str, dict[str, Any]] = {}
         search_queries = self._market_search_queries(question)
 
         request_specs: list[tuple[str, dict[str, Any]]] = []
+        # The gamma /markets and /events endpoints ignore the "search" param and
+        # return a generic active list (which surfaces irrelevant markets). The
+        # /public-search endpoint is the one that actually full-text matches and
+        # returns events with nested candidate markets, so query it first.
+        for query in search_queries[:3]:
+            request_specs.append(
+                (
+                    public_search_url,
+                    {"q": query, "limit_per_type": 10, "events_status": "active"},
+                )
+            )
         for query in search_queries[:6]:
             request_specs.append(
                 (
@@ -3507,10 +3700,361 @@ class SpringTemplateBot2026(ForecastBot):
         return evidence_items[: self._direct_evidence_max_items_per_provider]
 
     @classmethod
+    def _betfair_enabled(cls) -> bool:
+        """Betfair stays completely inert unless it is explicitly enabled and
+        both an app key and a session token are configured. Acquiring a session
+        token requires Betfair's interactive/cert login, which the operator must
+        perform out-of-band; this provider only consumes a supplied token."""
+        return (
+            cls._env_flag("ENABLE_BETFAIR_MARKETS", False)
+            and bool(os.getenv("BETFAIR_APP_KEY", "").strip())
+            and bool(os.getenv("BETFAIR_SESSION_TOKEN", "").strip())
+        )
+
+    async def _fetch_cached_betfair_markets(
+        self, question: MetaculusQuestion
+    ) -> list[EvidenceItem]:
+        return await self._cached_evidence_fetch(
+            "betfair", question, lambda: self._fetch_betfair_markets(question)
+        )
+
+    async def _fetch_betfair_markets(
+        self, question: MetaculusQuestion
+    ) -> list[EvidenceItem]:
+        if not self._betfair_enabled():
+            return []
+        app_key = os.getenv("BETFAIR_APP_KEY", "").strip()
+        session_token = os.getenv("BETFAIR_SESSION_TOKEN", "").strip()
+        base_url = os.getenv(
+            "BETFAIR_API_BASE_URL",
+            "https://api.betfair.com/exng/betting/json-rpc/v1",
+        ).rstrip("/")
+        headers = {
+            "X-Application": app_key,
+            "X-Authentication": session_token,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        search_queries = self._market_search_queries(question)
+        text_query = (
+            search_queries[0]
+            if search_queries
+            else str(getattr(question, "question_text", ""))
+        )
+        catalogue_payload = {
+            "jsonrpc": "2.0",
+            "method": "SportsAPING/v1.0/listMarketCatalogue",
+            "params": {
+                "filter": {
+                    "eventTypeIds": [
+                        os.getenv("BETFAIR_POLITICS_EVENT_TYPE_ID", "2378961")
+                    ],
+                    "textQuery": text_query,
+                },
+                "maxResults": int(os.getenv("BETFAIR_MAX_MARKETS", "10")),
+                "marketProjection": [
+                    "RUNNER_DESCRIPTION",
+                    "EVENT",
+                    "MARKET_START_TIME",
+                ],
+            },
+            "id": 1,
+        }
+        try:
+            catalogue = await self._http_post_json(
+                base_url, json_body=catalogue_payload, headers=headers, timeout=25
+            )
+        except Exception as error:
+            logger.warning("Betfair market catalogue fetch failed: %r", error)
+            return []
+        catalogue_result = (
+            catalogue.get("result", []) if isinstance(catalogue, dict) else []
+        )
+        if not isinstance(catalogue_result, list) or not catalogue_result:
+            return []
+        market_ids = [
+            str(market.get("marketId"))
+            for market in catalogue_result
+            if isinstance(market, dict) and market.get("marketId")
+        ]
+        book_by_id: dict[str, dict[str, Any]] = {}
+        if market_ids:
+            book_payload = {
+                "jsonrpc": "2.0",
+                "method": "SportsAPING/v1.0/listMarketBook",
+                "params": {
+                    "marketIds": market_ids,
+                    "priceProjection": {"priceData": ["EX_BEST_OFFERS"]},
+                },
+                "id": 1,
+            }
+            try:
+                book = await self._http_post_json(
+                    base_url, json_body=book_payload, headers=headers, timeout=25
+                )
+                for market_book in (
+                    book.get("result", []) if isinstance(book, dict) else []
+                ):
+                    if isinstance(market_book, dict) and market_book.get("marketId"):
+                        book_by_id[str(market_book["marketId"])] = market_book
+            except Exception as error:
+                logger.warning("Betfair market book fetch failed: %r", error)
+
+        evidence_items: list[EvidenceItem] = []
+        for market in catalogue_result:
+            if not isinstance(market, dict):
+                continue
+            market_id = str(market.get("marketId") or "")
+            market_name = str(market.get("marketName") or "")
+            event = market.get("event") if isinstance(market.get("event"), dict) else {}
+            event_name = str(event.get("name") or "")
+            candidate_text = f"{market_name} {event_name}"
+            score = self._relevance_score(candidate_text, question)
+            directness = self._market_relevance_directness(
+                candidate_text, question, score
+            )
+            if directness is None:
+                continue
+            runner_names = {
+                str(runner.get("selectionId")): str(runner.get("runnerName") or "")
+                for runner in (market.get("runners") or [])
+                if isinstance(runner, dict)
+            }
+            runner_probabilities: list[str] = []
+            book = book_by_id.get(market_id, {})
+            for runner_book in (
+                book.get("runners", []) if isinstance(book, dict) else []
+            ):
+                if not isinstance(runner_book, dict):
+                    continue
+                selection_id = str(runner_book.get("selectionId"))
+                name = runner_names.get(selection_id, selection_id)
+                ex = runner_book.get("ex") if isinstance(runner_book.get("ex"), dict) else {}
+                back = ex.get("availableToBack") or []
+                price = None
+                if back and isinstance(back[0], dict):
+                    odds = back[0].get("price")
+                    try:
+                        price = 1.0 / float(odds) if odds and float(odds) > 0 else None
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        price = None
+                if price is not None:
+                    runner_probabilities.append(f"{name}={price:.3f}")
+            url = (
+                f"https://www.betfair.com/exchange/plus/politics/market/{market_id}"
+                if market_id
+                else "https://www.betfair.com/exchange/plus/politics"
+            )
+            evidence_items.append(
+                EvidenceItem(
+                    source="Betfair",
+                    provider="betfair",
+                    title=market_name or event_name or market_id,
+                    url=url,
+                    retrieved_at=datetime.now(timezone.utc).isoformat(),
+                    summary=(
+                        f"Betfair Exchange market '{market_name}'. Implied "
+                        "probabilities from best back prices (not "
+                        "overround-adjusted)."
+                    ),
+                    value="; ".join(runner_probabilities) or "no live prices",
+                    date=str(market.get("marketStartTime") or ""),
+                    directness=directness,
+                    caveats=(
+                        "Betfair back-odds converted to probabilities are not "
+                        "overround-adjusted; verify the market matches the "
+                        "resolution criteria."
+                    ),
+                    raw={"marketId": market_id, "marketName": market_name},
+                )
+            )
+        return evidence_items[: self._direct_evidence_max_items_per_provider]
+
+    @classmethod
+    def _odds_api_enabled(cls) -> bool:
+        return cls._env_flag("ENABLE_ODDS_API_MARKETS", True) and bool(
+            os.getenv("ODDS_API_KEY", "").strip()
+        )
+
+    async def _fetch_cached_odds_api_markets(
+        self, question: MetaculusQuestion
+    ) -> list[EvidenceItem]:
+        return await self._cached_evidence_fetch(
+            "odds_api", question, lambda: self._fetch_odds_api_markets(question)
+        )
+
+    async def _fetch_odds_api_markets(
+        self, question: MetaculusQuestion
+    ) -> list[EvidenceItem]:
+        """the-odds-api.com provider. Note: this service only covers sports plus
+        the US presidential-election winner -- it has no UK/by-election markets.
+        Inert unless ODDS_API_KEY is set. Sport selection is restricted by token
+        overlap with the question to keep API quota usage bounded."""
+        api_key = os.getenv("ODDS_API_KEY", "").strip()
+        if not api_key:
+            return []
+        base_url = os.getenv(
+            "ODDS_API_BASE_URL", "https://api.the-odds-api.com/v4"
+        ).rstrip("/")
+        try:
+            sports = await self._http_get_json(
+                f"{base_url}/sports", params={"apiKey": api_key}, timeout=20
+            )
+        except Exception as error:
+            logger.warning("Odds API sports list fetch failed: %r", error)
+            return []
+        if not isinstance(sports, list):
+            return []
+        question_terms = self._question_terms(question)
+        scored_sports: list[tuple[int, dict[str, Any]]] = []
+        for sport in sports:
+            if not isinstance(sport, dict) or not sport.get("active"):
+                continue
+            sport_text = " ".join(
+                str(sport.get(key, ""))
+                for key in ("key", "group", "title", "description")
+            )
+            overlap = len(self._text_tokens(sport_text) & question_terms)
+            if overlap:
+                scored_sports.append((overlap, sport))
+        scored_sports.sort(key=lambda item: item[0], reverse=True)
+        max_sports = int(os.getenv("ODDS_API_MAX_SPORTS", "3"))
+        candidate_sports = [sport for _, sport in scored_sports[:max_sports]]
+        if self._is_election_question(question):
+            for sport in sports:
+                if (
+                    isinstance(sport, dict)
+                    and "president" in str(sport.get("key", "")).lower()
+                    and sport not in candidate_sports
+                ):
+                    candidate_sports.append(sport)
+        if not candidate_sports:
+            return []
+        regions = os.getenv("ODDS_API_REGIONS", "uk,us,eu,au")
+        evidence_items: list[EvidenceItem] = []
+        for sport in candidate_sports:
+            sport_key = sport.get("key")
+            market_type = "outrights" if sport.get("has_outrights") else "h2h"
+            try:
+                events = await self._http_get_json(
+                    f"{base_url}/sports/{sport_key}/odds",
+                    params={
+                        "apiKey": api_key,
+                        "regions": regions,
+                        "markets": market_type,
+                        "oddsFormat": "decimal",
+                    },
+                    timeout=25,
+                )
+            except Exception as error:
+                logger.warning(
+                    "Odds API odds fetch failed for %s: %r", sport_key, error
+                )
+                continue
+            if not isinstance(events, list):
+                continue
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                teams = [
+                    str(event.get("home_team", "")),
+                    str(event.get("away_team", "")),
+                ]
+                best_by_outcome: dict[str, float] = {}
+                for bookmaker in event.get("bookmakers", []) or []:
+                    markets = (
+                        bookmaker.get("markets", [])
+                        if isinstance(bookmaker, dict)
+                        else []
+                    )
+                    for market in markets:
+                        outcomes = (
+                            market.get("outcomes", [])
+                            if isinstance(market, dict)
+                            else []
+                        )
+                        for outcome in outcomes:
+                            if not isinstance(outcome, dict):
+                                continue
+                            name = str(outcome.get("name", ""))
+                            price = outcome.get("price")
+                            try:
+                                prob = (
+                                    1.0 / float(price)
+                                    if price and float(price) > 0
+                                    else None
+                                )
+                            except (TypeError, ValueError, ZeroDivisionError):
+                                prob = None
+                            if prob is not None and name:
+                                best_by_outcome[name] = max(
+                                    best_by_outcome.get(name, 0.0), prob
+                                )
+                candidate_text = " ".join(
+                    [str(sport.get("title", "")), str(event.get("sport_title", ""))]
+                    + [team for team in teams if team]
+                    + list(best_by_outcome.keys())
+                )
+                score = self._relevance_score(candidate_text, question)
+                directness = self._market_relevance_directness(
+                    candidate_text, question, score
+                )
+                if directness is None:
+                    continue
+                outcome_text = "; ".join(
+                    f"{name}={prob:.3f}" for name, prob in best_by_outcome.items()
+                )
+                matchup = " vs ".join(team for team in teams if team)
+                title = (
+                    f"{event.get('sport_title') or sport.get('title', '')}: "
+                    f"{matchup or sport.get('title', '')}"
+                )
+                evidence_items.append(
+                    EvidenceItem(
+                        source="The Odds API",
+                        provider="odds_api",
+                        title=title,
+                        url="https://the-odds-api.com/",
+                        retrieved_at=datetime.now(timezone.utc).isoformat(),
+                        summary=(
+                            f"Bookmaker odds via the-odds-api ({market_type}); "
+                            "implied probabilities from the best decimal price "
+                            "across bookmakers."
+                        ),
+                        value=outcome_text or "no prices",
+                        date=str(event.get("commence_time", "")),
+                        directness=directness,
+                        caveats=(
+                            "Bookmaker odds include overround (not normalised); "
+                            "this service covers sports + US presidential winner "
+                            "only. Verify the market matches the resolution "
+                            "criteria."
+                        ),
+                        raw={"sport_key": sport_key, "id": event.get("id")},
+                    )
+                )
+        return evidence_items[: self._direct_evidence_max_items_per_provider]
+
+    @classmethod
     def _market_search_query(cls, question: MetaculusQuestion) -> str:
         question_text = getattr(question, "question_text", "")
-        cleaned = re.sub(r"\b(will|by|before|after|resolve|happen|there|be)\b", " ", question_text, flags=re.IGNORECASE)
+        # Strip filler words only when they stand alone, so hyphenated compounds
+        # such as "by-election" are preserved. A naive \bby\b would match the "by"
+        # in "by-election" (the hyphen is a word boundary) and leave "-election",
+        # which several market search APIs (e.g. Manifold) read as "exclude
+        # election" -- silently dropping every relevant market.
+        cleaned = re.sub(
+            r"(?<![\w-])(?:will|by|before|after|resolve|happen|there|be)(?![\w-])",
+            " ",
+            question_text,
+            flags=re.IGNORECASE,
+        )
         cleaned = re.sub(r"[^a-zA-Z0-9 \-]", " ", cleaned)
+        # Drop any token that begins with '-' so it can never act as a negation
+        # operator in a downstream market search query.
+        cleaned = " ".join(
+            token for token in cleaned.split() if not token.startswith("-")
+        )
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         return cleaned[:140] or question_text[:140]
 
@@ -5497,47 +6041,44 @@ if __name__ == "__main__":
     if run_mode in ["tournament", "minibench", "benchmarking_questions"]:
         forecast_reports = []
         for tournament_id in target_tournament_ids:
-            if args.max_questions is not None:
-                questions = _get_open_tournament_questions(client, tournament_id)
-                eligible_questions = (
-                    _filter_previously_forecasted_questions(questions)
-                    if template_bot.skip_previously_forecasted_questions
-                    else questions
-                )
-                selected_questions = _select_question_batch(
-                    eligible_questions,
-                    max_questions=args.max_questions,
-                    shuffle_seed=args.question_shuffle_seed,
-                )
-                logger.info(
-                    "Selected %s of %s eligible open questions from tournament %s "
-                    "(%s open total, max_questions=%s, shuffle_seed=%s)",
-                    len(selected_questions),
-                    len(eligible_questions),
-                    tournament_id,
-                    len(questions),
-                    args.max_questions,
-                    args.question_shuffle_seed,
-                )
-                if args.continue_on_question_errors:
-                    forecast_reports.extend(
-                        _forecast_questions_resiliently(
-                            template_bot, selected_questions
-                        )
+            # Always fetch open AND upcoming questions so the scheduled job
+            # picks up questions as soon as they appear in the tournament,
+            # not only those already in the open window. This is what the
+            # forecast_on_tournament path (open-only) was silently missing.
+            # max_questions is now an optional cap: None => forecast every
+            # eligible question (the normal scheduled-run behaviour).
+            questions = _get_open_tournament_questions(client, tournament_id)
+            eligible_questions = (
+                _filter_previously_forecasted_questions(questions)
+                if template_bot.skip_previously_forecasted_questions
+                else questions
+            )
+            selected_questions = _select_question_batch(
+                eligible_questions,
+                max_questions=args.max_questions,
+                shuffle_seed=args.question_shuffle_seed,
+            )
+            logger.info(
+                "Selected %s of %s eligible questions from tournament %s "
+                "(%s open+upcoming total, max_questions=%s, shuffle_seed=%s)",
+                len(selected_questions),
+                len(eligible_questions),
+                tournament_id,
+                len(questions),
+                args.max_questions,
+                args.question_shuffle_seed,
+            )
+            if args.continue_on_question_errors:
+                forecast_reports.extend(
+                    _forecast_questions_resiliently(
+                        template_bot, selected_questions
                     )
-                else:
-                    forecast_reports.extend(
-                        asyncio.run(
-                            template_bot.forecast_questions(
-                                selected_questions, return_exceptions=True
-                            )
-                        )
-                    )
+                )
             else:
                 forecast_reports.extend(
                     asyncio.run(
-                        template_bot.forecast_on_tournament(
-                            tournament_id, return_exceptions=True
+                        template_bot.forecast_questions(
+                            selected_questions, return_exceptions=True
                         )
                     )
                 )
