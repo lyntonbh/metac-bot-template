@@ -41,6 +41,7 @@ from forecasting_tools import (
     PredictionTypes,
     PredictionAffirmed,
     BinaryPrediction,
+    PredictedOption,
     PredictedOptionList,
     ReasonedPrediction,
     SmartSearcher,
@@ -5270,6 +5271,8 @@ class SpringTemplateBot2026(ForecastBot):
             Option_B: Probability_B
             ...
             Option_N: Probability_N
+
+            The probabilities must sum to exactly 100%. Double-check the sum before answering.
             """
         )
         return await self._multiple_choice_prompt_to_forecast(question, prompt)
@@ -5342,6 +5345,7 @@ class SpringTemplateBot2026(ForecastBot):
 
             The text you are parsing may prepend these options with some variation of "Option" which you should remove if not part of the option names I just gave you.
             Additionally, you may sometimes need to parse a 0% probability. Please do not skip options with 0% but rather make it an entry in your final list with 0% probability.
+            If the probabilities in the text do not sum to 1.0, rescale them proportionally (divide each by their total) so they sum to exactly 1.0 before responding.
             """
         )
         reasoning = await llm.invoke(prompt)
@@ -5353,13 +5357,25 @@ class SpringTemplateBot2026(ForecastBot):
             question.page_url,
             reasoning,
         )
-        predicted_option_list: PredictedOptionList = await structure_output(
-            text_to_structure=reasoning,
-            output_type=PredictedOptionList,
-            model=self.get_llm("parser", "llm"),
-            num_validation_samples=self._structure_output_validation_samples,
-            additional_instructions=parsing_instructions,
-        )
+        try:
+            predicted_option_list: PredictedOptionList = await structure_output(
+                text_to_structure=reasoning,
+                output_type=PredictedOptionList,
+                model=self.get_llm("parser", "llm"),
+                num_validation_samples=self._structure_output_validation_samples,
+                additional_instructions=parsing_instructions,
+            )
+        except Exception as parse_error:
+            logger.warning(
+                "Structured MC parse failed for URL %s (%s); retrying with "
+                "deterministic renormalization: %r",
+                question.page_url,
+                role_name,
+                parse_error,
+            )
+            predicted_option_list = await self._parse_mc_with_renormalization(
+                question, reasoning
+            )
 
         logger.info(
             f"Forecasted URL {question.page_url} with {llm.model} ({role_name}) prediction: {predicted_option_list}."
@@ -5367,6 +5383,62 @@ class SpringTemplateBot2026(ForecastBot):
         return ReasonedPrediction(
             prediction_value=predicted_option_list,
             reasoning=f"Role: {role_name}\nModel: {llm.model}\n\n{reasoning}",
+        )
+
+    async def _parse_mc_with_renormalization(
+        self, question: MultipleChoiceQuestion, reasoning: str
+    ) -> PredictedOptionList:
+        """Fallback when structured parsing rejects the probabilities (e.g. the
+        model's options sum to 1.065, outside PredictedOptionList's [0.99, 1.01]
+        tolerance): extract raw numbers with the parser, renormalize exactly in
+        Python, and build the validated object from the corrected values."""
+        extraction_prompt = clean_indents(
+            f"""
+            Extract the final probability given for each option from the text below.
+            Respond with ONLY a JSON object mapping each option name to its probability
+            as a decimal (e.g. {{"Option A": 0.25}}). Use exactly these option names:
+            {list(question.options)}
+            Include every option, using 0.0 if the text gives it no probability.
+            Do not rescale or correct the numbers; report them as stated.
+
+            Text:
+            {reasoning[-8000:]}
+            """
+        )
+        raw = await self.get_llm("parser", "llm").invoke(extraction_prompt)
+        json_match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not json_match:
+            raise ValueError(
+                f"MC renormalization fallback got no JSON from parser: {raw[:200]!r}"
+            )
+        extracted = json.loads(json_match.group(0))
+
+        def _match_option(option: str) -> float:
+            for name, value in extracted.items():
+                if name.strip().lower() == option.strip().lower():
+                    return float(value)
+            raise ValueError(
+                f"MC renormalization fallback missing option {option!r}; "
+                f"parser returned {sorted(extracted)}"
+            )
+
+        probabilities = [_match_option(option) for option in question.options]
+        total = sum(probabilities)
+        if total <= 0:
+            raise ValueError(
+                f"MC renormalization fallback got non-positive total {total}"
+            )
+        # Values >1 are probably percentages the parser forgot to convert.
+        if total > 3:
+            probabilities = [p / 100 for p in probabilities]
+            total = sum(probabilities)
+        normalized = [p / total for p in probabilities]
+        normalized[-1] += 1.0 - sum(normalized)
+        return PredictedOptionList(
+            predicted_options=[
+                PredictedOption(option_name=option, probability=probability)
+                for option, probability in zip(question.options, normalized)
+            ]
         )
 
     ##################################### NUMERIC QUESTIONS #####################################

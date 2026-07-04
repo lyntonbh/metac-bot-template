@@ -101,6 +101,10 @@ jobs:
           SUMMARIZER_MAX_TOKENS: "2048"
           PARSER_MAX_TOKENS: "1024"
           CONTINUE_ON_QUESTION_ERRORS: "true"
+          # Exa key is out of credits (402s); pin research to OpenRouter-backed
+          # perplexity so the configured-research section never silently drops.
+          RESEARCHER_MODEL: "perplexity"
+          RESEARCHER_FALLBACK_MODEL: "perplexity"
           ENABLE_SUPPLEMENTAL_WEB_RESEARCH: "false"
           ENABLE_MARKET_PRIOR_RESEARCH: "false"
           ENABLE_OFFICIAL_DATA_RESEARCH: "false"
