@@ -110,6 +110,12 @@ jobs:
           ALLOW_PUBLISH_EXPERIMENTS: "false"
           ENABLE_EXPERIMENT_LOGGING: "true"
           EXPERIMENT_LOG_DIR: "experiment_logs"
+          # Decomposition A/B: each question is deterministically assigned an arm
+          # (hash of question id + salt), so re-forecasts never switch arms.
+          # Compare arms after resolution with scripts/score_decomposition_arms.py.
+          DECOMPOSITION_MODE: "random"
+          DECOMPOSITION_ARM_SALT: "decomp-v1"
+          DECOMPOSITION_SUBQUESTION_RESEARCH: "true"
       - name: Publish practice forecast status
         if: always()
         run: |

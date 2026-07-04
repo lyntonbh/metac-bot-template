@@ -326,12 +326,16 @@ def _log_startup_key_status() -> None:
         "DEFAULT_FORECASTER_MODEL": os.getenv(
             "DEFAULT_FORECASTER_MODEL", "openrouter/mistralai/mistral-large-2512"
         ),
-        "SUMMARIZER_MODEL": os.getenv("SUMMARIZER_MODEL", "openrouter/openai/gpt-5-nano"),
-        "PARSER_MODEL": os.getenv("PARSER_MODEL", "openrouter/openai/gpt-5-nano"),
+        "SUMMARIZER_MODEL": os.getenv(
+            "SUMMARIZER_MODEL", "openrouter/mistralai/mistral-large-2512"
+        ),
+        "PARSER_MODEL": os.getenv(
+            "PARSER_MODEL", "openrouter/mistralai/mistral-large-2512"
+        ),
         "ESCALATION_FORECASTER_MODEL": os.getenv(
             "ESCALATION_FORECASTER_MODEL", "openrouter/openai/gpt-5.5"
         ),
-        "SCOUT_MODEL": os.getenv("SCOUT_MODEL", "openrouter/z-ai/glm-5.1"),
+        "SCOUT_MODEL": os.getenv("SCOUT_MODEL", "openrouter/z-ai/glm-5.2"),
     }
     missing_model_keys = sorted(
         {
@@ -458,7 +462,9 @@ def _question_log_record(question: Any) -> dict[str, Any]:
     return record
 
 
-def _report_log_record(report: Any) -> dict[str, Any]:
+def _report_log_record(
+    report: Any, decomposition_arms: dict[str, str] | None = None
+) -> dict[str, Any]:
     if isinstance(report, BaseException):
         return {
             "status": "exception",
@@ -466,7 +472,7 @@ def _report_log_record(report: Any) -> dict[str, Any]:
             "exception": _json_safe(report),
         }
     question = getattr(report, "question", None)
-    return {
+    record = {
         "status": "ok",
         "report_type": type(report).__name__,
         "question": _question_log_record(question),
@@ -474,6 +480,12 @@ def _report_log_record(report: Any) -> dict[str, Any]:
         "explanation": _json_safe(getattr(report, "explanation", "")),
         "research": _json_safe(getattr(report, "research", "")),
     }
+    if decomposition_arms:
+        page_url = getattr(question, "page_url", None)
+        arm = decomposition_arms.get(page_url) if page_url else None
+        if arm:
+            record["decomposition_arm"] = arm
+    return record
 
 
 def _summarize_forecast_reports(
@@ -575,6 +587,7 @@ def _write_experiment_logs(
     selected_variant: ExperimentVariant | None,
     experiment_seed: int | None,
     publish_reports: bool,
+    decomposition_arms: dict[str, str] | None = None,
 ) -> None:
     if not _env_bool("ENABLE_EXPERIMENT_LOGGING", True):
         return
@@ -629,6 +642,11 @@ def _write_experiment_logs(
                 "PERPLEXITY_RESEARCHER_MODEL",
                 "OPENROUTER_PERPLEXITY_RESEARCHER_MODEL",
                 "EXA_RESEARCHER_MODEL",
+                "DECOMPOSITION_MODE",
+                "DECOMPOSITION_ARM_SALT",
+                "DECOMPOSITION_SUBQUESTION_RESEARCH",
+                "DECOMPOSITION_MODEL",
+                "DECOMPOSITION_RESEARCHER_MODEL",
             )
         },
         "forecast_summary": summary,
@@ -656,7 +674,7 @@ def _write_experiment_logs(
             record = {
                 "run_id": run_id,
                 "variant": variant_payload,
-                "report": _report_log_record(report),
+                "report": _report_log_record(report, decomposition_arms),
             }
             handle.write(json.dumps(record, ensure_ascii=True) + "\n")
     logger.info("Experiment logs written to %s", run_dir)
@@ -1137,7 +1155,7 @@ class SpringTemplateBot2026(ForecastBot):
                 llm=GeneralLlm(
                     model=os.getenv(
                         "INSIDE_VIEW_FORECASTER_MODEL",
-                        "openrouter/z-ai/glm-5.1",
+                        "openrouter/z-ai/glm-5.2",
                     ),
                     temperature=0.25,
                     timeout=180,
@@ -2260,6 +2278,233 @@ class SpringTemplateBot2026(ForecastBot):
         )
         return self._build_escalation_prompt(prompt, predictions, targeted_research)
 
+    ############################ QUESTION DECOMPOSITION ############################
+    # A/B experiment: decompose the question into 3-5 sub-questions, research and
+    # answer each, and feed the answers into the final forecast. Arm assignment is
+    # deterministic per question (hash of question id + salt) so re-forecasts of
+    # the same question always land in the same arm.
+
+    _DECOMPOSITION_BANNER = "## Decomposition analysis"
+
+    @staticmethod
+    def _decomposition_mode() -> str:
+        mode = os.getenv("DECOMPOSITION_MODE", "off").strip().lower()
+        if mode not in ("off", "on", "random"):
+            logger.warning(
+                "Invalid DECOMPOSITION_MODE %r; falling back to 'off'.", mode
+            )
+            return "off"
+        return mode
+
+    @staticmethod
+    def _decomposition_stable_id(question: MetaculusQuestion) -> str:
+        return str(
+            getattr(question, "id_of_question", None)
+            or getattr(question, "id_of_post", None)
+            or question.page_url
+            or question.question_text
+        )
+
+    def _decomposition_key(self, question: MetaculusQuestion) -> str:
+        return question.page_url or self._decomposition_stable_id(question)
+
+    def _decomposition_arms_by_question(self) -> dict[str, str]:
+        if not hasattr(self, "_decomposition_arms"):
+            self._decomposition_arms: dict[str, str] = {}
+        return self._decomposition_arms
+
+    def _decomposition_blocks_by_question(self) -> dict[str, str]:
+        if not hasattr(self, "_decomposition_blocks"):
+            self._decomposition_blocks: dict[str, str] = {}
+        return self._decomposition_blocks
+
+    def _decomposition_arm_is_on(self, question: MetaculusQuestion) -> bool:
+        mode = self._decomposition_mode()
+        if mode == "off":
+            return False
+        if mode == "on":
+            return True
+        salt = os.getenv("DECOMPOSITION_ARM_SALT", "decomp-v1")
+        stable_id = self._decomposition_stable_id(question)
+        digest = hashlib.sha256(f"{salt}:{stable_id}".encode("utf-8")).hexdigest()
+        return int(digest[:8], 16) % 2 == 0
+
+    def _decomposition_llm(self) -> GeneralLlm:
+        return GeneralLlm(
+            model=os.getenv(
+                "DECOMPOSITION_MODEL", "openrouter/mistralai/mistral-large-2512"
+            ),
+            temperature=0.2,
+            timeout=120,
+            allowed_tries=2,
+            max_tokens=1500,
+        )
+
+    def _decomposition_researcher_llm(self) -> GeneralLlm:
+        return GeneralLlm(
+            model=os.getenv(
+                "DECOMPOSITION_RESEARCHER_MODEL", "openrouter/perplexity/sonar"
+            ),
+            temperature=0.1,
+            timeout=120,
+            allowed_tries=2,
+            max_tokens=900,
+        )
+
+    async def _propose_subquestions(
+        self, question: MetaculusQuestion, research: str
+    ) -> list[str]:
+        prompt = clean_indents(
+            f"""
+            You are decomposing a forecasting question into sub-questions.
+
+            Propose 3 to 5 crisp sub-questions whose answers would most change a
+            careful forecast of the main question. Prefer sub-questions about:
+            - necessary preconditions or blockers implied by the resolution criteria
+            - the current value and trajectory of the key quantity
+            - decision-makers' incentives or stated timelines
+            - relevant base rates for this class of event
+
+            Rules:
+            - Each sub-question must be independently researchable and answerable now.
+            - No compound sub-questions; one fact or judgment each.
+            - Output ONLY a numbered list, one sub-question per line, no commentary.
+
+            Main question:
+            {question.question_text}
+
+            Resolution criteria:
+            {question.resolution_criteria}
+
+            Background:
+            {question.background_info}
+
+            Research memo (context, may be partial):
+            {research[:6000]}
+            """
+        )
+        raw = await self._decomposition_llm().invoke(prompt)
+        subquestions: list[str] = []
+        for line in raw.splitlines():
+            match = re.match(r"^\s*\d+[\.\)]\s*(.+?)\s*$", line)
+            if match and len(match.group(1)) > 12:
+                subquestions.append(match.group(1))
+        return subquestions[: _env_int("DECOMPOSITION_MAX_SUBQUESTIONS", 5)]
+
+    async def _answer_subquestion(
+        self, question: MetaculusQuestion, subquestion: str, research: str
+    ) -> str:
+        if self._env_flag("DECOMPOSITION_SUBQUESTION_RESEARCH", True):
+            prompt = clean_indents(
+                f"""
+                Research and answer this sub-question in at most 120 words.
+                Lead with the direct answer, then key facts with source names and dates.
+                If the answer is genuinely unknown, say so and give the best available proxy.
+
+                Sub-question:
+                {subquestion}
+
+                This supports forecasting the main question:
+                {question.question_text}
+                """
+            )
+            return await self._decomposition_researcher_llm().invoke(prompt)
+        prompt = clean_indents(
+            f"""
+            Answer this sub-question in at most 120 words using ONLY the research memo below.
+            Lead with the direct answer. If the memo does not contain the answer, say what
+            is missing and give your best inference, clearly labeled as inference.
+
+            Sub-question:
+            {subquestion}
+
+            Research memo:
+            {research[:8000]}
+            """
+        )
+        return await self._decomposition_llm().invoke(prompt)
+
+    async def _run_question_decomposition(
+        self, question: MetaculusQuestion, research: str
+    ) -> str:
+        # Never fail the question because of the experiment arm: any error or
+        # timeout degrades to "no decomposition block" and is logged as on_failed.
+        try:
+            return await asyncio.wait_for(
+                self._run_question_decomposition_inner(question, research),
+                timeout=_env_int("DECOMPOSITION_TIMEOUT_SECONDS", 300),
+            )
+        except Exception as error:
+            logger.warning(
+                "Question decomposition failed for URL %s: %r",
+                question.page_url,
+                error,
+            )
+            return ""
+
+    async def _run_question_decomposition_inner(
+        self, question: MetaculusQuestion, research: str
+    ) -> str:
+        subquestions = await self._propose_subquestions(question, research)
+        if len(subquestions) < 2:
+            logger.warning(
+                "Decomposition produced %s usable sub-question(s) for URL %s; skipping.",
+                len(subquestions),
+                question.page_url,
+            )
+            return ""
+        answers = await asyncio.gather(
+            *(
+                self._answer_subquestion(question, subquestion, research)
+                for subquestion in subquestions
+            ),
+            return_exceptions=True,
+        )
+        answered_sections: list[str] = []
+        usable_answers = 0
+        for index, (subquestion, answer) in enumerate(
+            zip(subquestions, answers), start=1
+        ):
+            if isinstance(answer, BaseException):
+                logger.warning(
+                    "Sub-question %s answer failed for URL %s: %r",
+                    index,
+                    question.page_url,
+                    answer,
+                )
+                answer_text = "Answer unavailable (sub-question research call failed)."
+            else:
+                answer_text = answer.strip()
+                usable_answers += 1
+            answered_sections.append(
+                f"### Sub-question {index}: {subquestion}\n{answer_text}"
+            )
+        if usable_answers == 0:
+            return ""
+        header = clean_indents(
+            f"""
+            {self._DECOMPOSITION_BANNER}
+            The main question was decomposed into sub-questions; each was investigated
+            independently. Weigh these answers explicitly when forming the final forecast,
+            and note whether the resolution criteria require ALL conditions to hold
+            (conjunctive) or ANY of them (disjunctive).
+            """
+        ).strip()
+        return header + "\n\n" + "\n\n".join(answered_sections)
+
+    async def summarize_research(
+        self, question: MetaculusQuestion, research: str
+    ) -> str:
+        summary = await super().summarize_research(question, research)
+        decomposition_block = self._decomposition_blocks_by_question().get(
+            self._decomposition_key(question)
+        )
+        if decomposition_block and self.use_research_summary_to_forecast:
+            # The forecasters see the 1-2 paragraph summary, not full research;
+            # re-append the block verbatim or the summarizer compresses it away.
+            summary = f"{summary}\n\n{decomposition_block}"
+        return summary
+
     ##################################### RESEARCH #####################################
 
     async def run_research(self, question: MetaculusQuestion) -> str:
@@ -2333,6 +2578,25 @@ class SpringTemplateBot2026(ForecastBot):
                     research_sections.append(f"## {section_name}\n{result}")
 
             research = "\n\n".join(research_sections)
+
+            decomposition_key = self._decomposition_key(question)
+            if self._decomposition_arm_is_on(question):
+                decomposition_block = await self._run_question_decomposition(
+                    question, research
+                )
+                if decomposition_block:
+                    self._decomposition_arms_by_question()[decomposition_key] = "on"
+                    self._decomposition_blocks_by_question()[decomposition_key] = (
+                        decomposition_block
+                    )
+                    research = f"{research}\n\n{decomposition_block}"
+                else:
+                    self._decomposition_arms_by_question()[decomposition_key] = (
+                        "on_failed"
+                    )
+            elif self._decomposition_mode() != "off":
+                self._decomposition_arms_by_question()[decomposition_key] = "off"
+
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
 
@@ -2583,7 +2847,7 @@ class SpringTemplateBot2026(ForecastBot):
 
     def _scout_llm(self) -> GeneralLlm:
         return GeneralLlm(
-            model=os.getenv("SCOUT_MODEL", "openrouter/z-ai/glm-5.1"),
+            model=os.getenv("SCOUT_MODEL", "openrouter/z-ai/glm-5.2"),
             temperature=0.1,
             timeout=_env_int("SCOUT_TIMEOUT_SECONDS", 180),
             allowed_tries=2,
@@ -6000,18 +6264,22 @@ if __name__ == "__main__":
                 max_tokens=_env_int("FORECASTER_MAX_TOKENS", 4096),
             ),
             "summarizer": GeneralLlm(
-                model=os.getenv("SUMMARIZER_MODEL", "openrouter/openai/gpt-5-nano"),
+                model=os.getenv(
+                    "SUMMARIZER_MODEL", "openrouter/mistralai/mistral-large-2512"
+                ),
                 temperature=0.1,
                 timeout=120,
                 allowed_tries=2,
-                max_tokens=_env_int("SUMMARIZER_MAX_TOKENS", 2048),
+                max_tokens=_env_int("SUMMARIZER_MAX_TOKENS", 4096),
             ),
             "parser": GeneralLlm(
-                model=os.getenv("PARSER_MODEL", "openrouter/openai/gpt-5-nano"),
+                model=os.getenv(
+                    "PARSER_MODEL", "openrouter/mistralai/mistral-large-2512"
+                ),
                 temperature=0,
                 timeout=120,
                 allowed_tries=2,
-                max_tokens=_env_int("PARSER_MAX_TOKENS", 1024),
+                max_tokens=_env_int("PARSER_MAX_TOKENS", 2048),
             ),
             "researcher": os.getenv("RESEARCHER_MODEL", "random"),
         },
@@ -6160,6 +6428,7 @@ if __name__ == "__main__":
         selected_variant=selected_variant,
         experiment_seed=experiment_seed,
         publish_reports=publish_reports,
+        decomposition_arms=getattr(template_bot, "_decomposition_arms", None),
     )
     _write_refresh_scout_logs(
         refresh_scout_decisions,

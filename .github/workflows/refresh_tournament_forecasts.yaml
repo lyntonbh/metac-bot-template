@@ -101,7 +101,7 @@ jobs:
           ALLOW_PUBLISH_EXPERIMENTS: "false"
           ENABLE_EXPERIMENT_LOGGING: "true"
           EXPERIMENT_LOG_DIR: "experiment_logs"
-          SCOUT_MODEL: "openrouter/z-ai/glm-5.1"
+          SCOUT_MODEL: "openrouter/z-ai/glm-5.2"
           SCOUT_RESEARCHER_MODEL: "perplexity"
           SCOUT_BINARY_ABS_MOVE: "0.08"
           SCOUT_BINARY_LOG_ODDS_MOVE: "0.35"
